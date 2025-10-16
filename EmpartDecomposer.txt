@@ -128,6 +128,54 @@ namespace Empart.EmberPart
             SymmetryEnforcement
         }
         /// <summary>
+        /// Topological vertex for the half-edge structure.
+        /// </summary>
+        public class MeshVertex
+        {
+            public float3 position;
+            public MeshHalfEdge leaving; // One of the half-edges leaving this vertex
+            public int index;
+            public MeshVertex(float3 pos, int idx) { position = pos; index = idx; }
+        }
+
+        /// <summary>
+        /// Topological face for the half-edge structure.
+        /// </summary>
+        public class MeshFace
+        {
+            public MeshHalfEdge edge; // One of the half-edges bordering this face
+            public float3 normal;
+            public int index;
+            public MeshFace(int idx) { index = idx; }
+        }
+
+        /// <summary>
+        /// Topological edge for the half-edge structure.
+        /// </summary>
+        public class MeshEdge
+        {
+            public MeshHalfEdge halfEdge; // One of the two half-edges of this edge
+            public int index;
+            public bool isSharp;
+            public MeshEdge(int idx) { index = idx; }
+        }
+
+        /// <summary>
+        /// The core half-edge data structure for efficient mesh traversal.
+        /// </summary>
+        public class MeshHalfEdge
+        {
+            public MeshVertex target; // Vertex at the end of this half-edge
+            public MeshHalfEdge next; // Next half-edge in the same face
+            public MeshHalfEdge prev; // Previous half-edge in the same face
+            public MeshHalfEdge twin; // The other half-edge of the same edge
+            public MeshEdge edge; // The edge this half-edge belongs to
+            public MeshFace face; // The face this half-edge belongs to
+            public int index;
+            public MeshHalfEdge(int idx) { index = idx; }
+        }
+
+        /// <summary>
         /// Burst-safe plane structure to replace UnityEngine.Plane
         /// </summary>
         public struct Plane4
@@ -306,6 +354,54 @@ namespace Empart.EmberPart
                 return true;
             }
         }
+
+        /// <summary>
+        /// Simple min-priority queue for Unity
+        /// </summary>
+        public sealed class MinPQ<T>
+        {
+            readonly List<(T item, float key)> _data = new();
+            readonly IComparer<float> _cmp = Comparer<float>.Default;
+            public int Count => _data.Count;
+            public void Enqueue(T item, float key)
+            {
+                _data.Add((item, key));
+                int i = _data.Count - 1;
+                while (i > 0)
+                {
+                    int p = (i - 1) >> 1;
+                    if (_cmp.Compare(_data[i].key, _data[p].key) >= 0) break;
+                    (_data[i], _data[p]) = (_data[p], _data[i]);
+                    i = p;
+                }
+            }
+            public T Dequeue()
+            {
+                if (_data.Count == 0) throw new InvalidOperationException("Queue is empty");
+                var root = _data[0].item;
+                int last = _data.Count - 1;
+                _data[0] = _data[last];
+                _data.RemoveAt(last);
+                int i = 0;
+                while (true)
+                {
+                    int l = i * 2 + 1, r = l + 1, smallest = i;
+                    if (l < _data.Count && _cmp.Compare(_data[l].key, _data[smallest].key) < 0) smallest = l;
+                    if (r < _data.Count && _cmp.Compare(_data[r].key, _data[smallest].key) < 0) smallest = r;
+                    if (smallest == i) break;
+                    (_data[i], _data[smallest]) = (_data[smallest], _data[i]);
+                    i = smallest;
+                }
+                return root;
+            }
+            public T Peek()
+            {
+                if (_data.Count == 0) throw new InvalidOperationException("Queue is empty");
+                return _data[0].item;
+            }
+            public void Clear() => _data.Clear();
+        }
+
         /// <summary>
         /// Approximate Vector3 comparer for duplicate vertex detection
         /// </summary>
@@ -589,6 +685,15 @@ namespace Empart.EmberPart
             // Additional: Topology information
             public int genus;
             public int eulerCharacteristic;
+
+            // Half-Edge Data Structure components
+            public List<MeshVertex> heVertices = new List<MeshVertex>();
+            public List<MeshEdge> heEdges = new List<MeshEdge>();
+            public List<MeshFace> heFaces = new List<MeshFace>();
+            public List<MeshHalfEdge> heHalfEdges = new List<MeshHalfEdge>();
+            public bool hasHalfEdgeData = false;
+            public List<int> faceClusterIds;
+
             /// <summary>
             /// Validate mesh data integrity
             /// </summary>
@@ -1388,6 +1493,72 @@ namespace Empart.EmberPart
                     genus = (2 - eulerCharacteristic) / 2;
                 }
             }
+
+            /// <summary>
+            /// Builds the half-edge data structure from the vertex and index lists.
+            /// </summary>
+            public void BuildHalfEdgeStructure()
+            {
+                if (vertices.Count == 0 || indices.Count == 0) return;
+
+                heVertices.Clear();
+                heEdges.Clear();
+                heFaces.Clear();
+                heHalfEdges.Clear();
+
+                // Create vertices
+                for (int i = 0; i < vertices.Count; i++)
+                {
+                    heVertices.Add(new MeshVertex(vertices[i], i));
+                }
+
+                var edgeMap = new Dictionary<(int, int), MeshHalfEdge>();
+
+                // Create faces and half-edges
+                for (int i = 0; i < indices.Count; i += 3)
+                {
+                    var face = new MeshFace(heFaces.Count);
+                    heFaces.Add(face);
+
+                    var h = new MeshHalfEdge[3];
+                    for (int j = 0; j < 3; j++)
+                    {
+                        h[j] = new MeshHalfEdge(heHalfEdges.Count);
+                        heHalfEdges.Add(h[j]);
+                    }
+
+                    for (int j = 0; j < 3; j++)
+                    {
+                        var v_start_idx = indices[i + j];
+                        var v_end_idx = indices[i + (j + 1) % 3];
+
+                        h[j].face = face;
+                        h[j].target = heVertices[v_end_idx];
+                        h[j].next = h[(j + 1) % 3];
+                        h[j].prev = h[(j + 2) % 3];
+
+                        heVertices[v_start_idx].leaving = h[j];
+
+                        var edgeKey = v_start_idx < v_end_idx ? (v_start_idx, v_end_idx) : (v_end_idx, v_start_idx);
+                        if (edgeMap.TryGetValue(edgeKey, out var twin))
+                        {
+                            h[j].twin = twin;
+                            twin.twin = h[j];
+                            h[j].edge = twin.edge;
+                        }
+                        else
+                        {
+                            var newEdge = new MeshEdge(heEdges.Count);
+                            heEdges.Add(newEdge);
+                            h[j].edge = newEdge;
+                            newEdge.halfEdge = h[j];
+                            edgeMap.Add(edgeKey, h[j]);
+                        }
+                    }
+                    face.edge = h[0];
+                }
+                hasHalfEdgeData = true;
+            }
         }
         /// <summary>
         /// Voxelization job for burst compilation
@@ -1788,6 +1959,13 @@ namespace Empart.EmberPart
             public bool isValid;
             public List<int> neighborHulls = new List<int>();
             public Dictionary<string, object> customProperties = new Dictionary<string, object>();
+
+            // Hierarchy and Adjacency
+            public ConvexHull parent;
+            public List<ConvexHull> children = new List<ConvexHull>();
+            public List<ConvexHull> neighbors = new List<ConvexHull>();
+            public MeshData sourceMesh; // The original mesh part this hull was generated from
+
             // Additional properties for advanced processing
             public List<Vector3> witnessPoints;
             public List<float> witnessErrors;
@@ -3939,11 +4117,32 @@ namespace Empart.EmberPart
             private static float EvaluateSplitPlane(MeshData mesh, Vector3 normal, Vector3 point)
             {
                 // Use a cost function based on the Surface Area Heuristic (SAH)
-                // This tries to create balanced splits.
+                // and feature preservation.
                 Bounds leftBounds = new Bounds();
                 Bounds rightBounds = new Bounds();
                 int leftCount = 0, rightCount = 0;
                 bool firstLeft = true, firstRight = true;
+
+                var cutClusters = new HashSet<int>();
+
+                for (int i = 0; i < mesh.heFaces.Count; i++)
+                {
+                    var face = mesh.heFaces[i];
+                    var v0 = mesh.vertices[mesh.indices[i*3]];
+                    var v1 = mesh.vertices[mesh.indices[i*3+1]];
+                    var v2 = mesh.vertices[mesh.indices[i*3+2]];
+
+                    float d0 = Vector3.Dot(v0 - point, normal);
+                    float d1 = Vector3.Dot(v1 - point, normal);
+                    float d2 = Vector3.Dot(v2 - point, normal);
+
+                    if ((d0 > 0 && (d1 < 0 || d2 < 0)) || (d0 < 0 && (d1 > 0 || d2 > 0)))
+                    {
+                        if(mesh.faceClusterIds != null && i < mesh.faceClusterIds.Count)
+                            cutClusters.Add(mesh.faceClusterIds[i]);
+                    }
+                }
+
                 foreach (var v in mesh.vertices)
                 {
                     float side = Vector3.Dot(v - point, normal);
@@ -3960,14 +4159,17 @@ namespace Empart.EmberPart
                         rightCount++;
                     }
                 }
+
                 if (leftCount == 0 || rightCount == 0) return float.MaxValue; // Invalid split
+
                 float surfaceAreaLeft = 2 * (leftBounds.size.x * leftBounds.size.y + leftBounds.size.x * leftBounds.size.z + leftBounds.size.y * leftBounds.size.z);
                 float surfaceAreaRight = 2 * (rightBounds.size.x * rightBounds.size.y + rightBounds.size.x * rightBounds.size.z + rightBounds.size.y * rightBounds.size.z);
-                float cost = surfaceAreaLeft * leftCount + surfaceAreaRight * rightCount;
-                // Additional: Penalize unbalanced splits
+
+                float sahCost = surfaceAreaLeft * leftCount + surfaceAreaRight * rightCount;
                 float balance = Mathf.Abs(leftCount - rightCount) / (float)(leftCount + rightCount);
-                cost *= 1 + balance;
-                return cost;
+                float featurePenalty = cutClusters.Count * 100f; // Heavy penalty for cutting features
+
+                return sahCost * (1 + balance) + featurePenalty;
             }
             private static void CalculatePCA(List<Vector3> points, out Vector3 axis1, out Vector3 axis2, out Vector3 axis3)
             {
@@ -4078,6 +4280,273 @@ namespace Empart.EmberPart
                 return (normal, point);
             }
         }
+
+        /// <summary>
+        /// Handles mesh simplification using the Quadric Error Metrics (QEM) algorithm.
+        /// This is a crucial pre-processing step for CoACD to handle complex meshes efficiently.
+        /// </summary>
+        public static class MeshDecimator
+        {
+            private class QEMVertex
+            {
+                public Vector3 position;
+                public Matrix4x4 q = Matrix4x4.zero;
+                public List<int> faceIndices = new List<int>();
+                public bool isBorder;
+            }
+
+            private class QEMFace
+            {
+                public int[] v = new int[3];
+                public Vector3 n;
+                public bool removed;
+            }
+
+            private class QEMEdge : IComparable<QEMEdge>
+            {
+                public int v1, v2;
+                public float cost;
+                public Vector3 optimalPosition;
+
+                public int CompareTo(QEMEdge other)
+                {
+                    if (other == null) return 1;
+                    return cost.CompareTo(other.cost);
+                }
+            }
+
+            public static void Decimate(MeshData mesh, int targetTriangleCount)
+            {
+                if (mesh.triangleCount <= targetTriangleCount) return;
+
+                // 1. Initialize data structures
+                var vertices = new List<QEMVertex>(mesh.vertexCount);
+                for(int i=0; i<mesh.vertexCount; ++i)
+                {
+                    vertices.Add(new QEMVertex { position = mesh.vertices[i] });
+                }
+
+                var faces = new List<QEMFace>(mesh.triangleCount);
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    var f = new QEMFace();
+                    f.v[0] = mesh.indices[i];
+                    f.v[1] = mesh.indices[i+1];
+                    f.v[2] = mesh.indices[i+2];
+                    f.n = Vector3.Cross(mesh.vertices[f.v[1]] - mesh.vertices[f.v[0]], mesh.vertices[f.v[2]] - mesh.vertices[f.v[0]]).normalized;
+                    faces.Add(f);
+                    vertices[f.v[0]].faceIndices.Add(faces.Count - 1);
+                    vertices[f.v[1]].faceIndices.Add(faces.Count - 1);
+                    vertices[f.v[2]].faceIndices.Add(faces.Count - 1);
+                }
+
+                // 2. Compute initial quadrics for all vertices
+                foreach (var v in vertices)
+                {
+                    foreach (var faceIdx in v.faceIndices)
+                    {
+                        var faceNormal = faces[faceIdx].n;
+                        var p = new Plane(faceNormal, v.position);
+                        var Kp = new Matrix4x4();
+                        Kp.m00 = p.normal.x * p.normal.x; Kp.m01 = p.normal.x * p.normal.y; Kp.m02 = p.normal.x * p.normal.z; Kp.m03 = p.normal.x * p.distance;
+                        Kp.m10 = p.normal.y * p.normal.x; Kp.m11 = p.normal.y * p.normal.y; Kp.m12 = p.normal.y * p.normal.z; Kp.m13 = p.normal.y * p.distance;
+                        Kp.m20 = p.normal.z * p.normal.x; Kp.m21 = p.normal.z * p.normal.y; Kp.m22 = p.normal.z * p.normal.z; Kp.m23 = p.normal.z * p.distance;
+                        Kp.m30 = p.distance * p.normal.x; Kp.m31 = p.distance * p.normal.y; Kp.m32 = p.distance * p.normal.z; Kp.m33 = p.distance * p.distance;
+                        v.q += Kp;
+                    }
+                }
+
+                // 3. Identify all edges and compute their contraction cost
+                var edgeQueue = new MinPQ<QEMEdge>();
+                var edgeSet = new HashSet<(int, int)>();
+
+                foreach(var f in faces)
+                {
+                    for(int i=0; i<3; ++i)
+                    {
+                        int v1_idx = f.v[i];
+                        int v2_idx = f.v[(i+1)%3];
+                        var key = v1_idx < v2_idx ? (v1_idx, v2_idx) : (v2_idx, v1_idx);
+                        if(edgeSet.Add(key))
+                        {
+                            var edge = new QEMEdge { v1 = v1_idx, v2 = v2_idx };
+                            CalculateEdgeCost(edge, vertices);
+                            edgeQueue.Enqueue(edge, edge.cost);
+                        }
+                    }
+                }
+
+                // 4. Iteratively collapse edges
+                int currentTriangleCount = mesh.triangleCount;
+                int removedCount = 0;
+                while(currentTriangleCount > targetTriangleCount && edgeQueue.Count > 0)
+                {
+                    var edge = edgeQueue.Dequeue();
+
+                    var v1 = vertices[edge.v1];
+                    var v2 = vertices[edge.v2];
+
+                    if (v1 == null || v2 == null) continue;
+
+                    var v1_faces_before = new List<int>(v1.faceIndices);
+
+                    // Collapse edge
+                    v1.position = edge.optimalPosition;
+                    v1.q += v2.q;
+
+                    var facesToRemove = new List<int>();
+                    foreach(var faceIdx in v2.faceIndices)
+                    {
+                        var face = faces[faceIdx];
+                        if (face.v[0] == edge.v1 || face.v[1] == edge.v1 || face.v[2] == edge.v1)
+                        {
+                            if(!faces[faceIdx].removed)
+                            {
+                                faces[faceIdx].removed = true;
+                                removedCount++;
+                            }
+                        }
+                        else
+                        {
+                            if (face.v[0] == edge.v2) face.v[0] = edge.v1;
+                            if (face.v[1] == edge.v2) face.v[1] = edge.v1;
+                            if (face.v[2] == edge.v2) face.v[2] = edge.v1;
+                            v1.faceIndices.Add(faceIdx);
+                        }
+                    }
+
+                    vertices[edge.v2] = null;
+
+                    // Re-evaluate the cost of edges connected to the collapsed vertex
+                    var edgesToRecompute = new HashSet<(int, int)>();
+                    foreach(var faceIdx in v1.faceIndices)
+                    {
+                        if(faces[faceIdx].removed) continue;
+                        var f = faces[faceIdx];
+                        for(int i=0; i<3; ++i)
+                        {
+                             edgesToRecompute.Add(f.v[i] < f.v[(i+1)%3] ? (f.v[i], f.v[(i+1)%3]) : (f.v[(i+1)%3], f.v[i]));
+                        }
+                    }
+
+                    foreach(var key in edgesToRecompute)
+                    {
+                        var newEdge = new QEMEdge { v1 = key.Item1, v2 = key.Item2 };
+                        CalculateEdgeCost(newEdge, vertices);
+                        edgeQueue.Enqueue(newEdge, newEdge.cost);
+                    }
+
+                    currentTriangleCount = mesh.triangleCount - removedCount;
+                }
+
+                // 5. Rebuild the mesh data
+                var finalVerts = new List<Vector3>();
+                var remap = new int[vertices.Count];
+                int newIdx = 0;
+                for(int i=0; i<vertices.Count; ++i)
+                {
+                    if(vertices[i] != null)
+                    {
+                        finalVerts.Add(vertices[i].position);
+                        remap[i] = newIdx++;
+                    }
+                }
+
+                var finalIndices = new List<int>();
+                foreach(var face in faces)
+                {
+                    if(!face.removed)
+                    {
+                        finalIndices.Add(remap[face.v[0]]);
+                        finalIndices.Add(remap[face.v[1]]);
+                        finalIndices.Add(remap[face.v[2]]);
+                    }
+                }
+
+                mesh.vertices = finalVerts;
+                mesh.indices = finalIndices;
+                mesh.normals.Clear();
+                mesh.Optimize();
+            }
+
+            private static void CalculateEdgeCost(QEMEdge edge, List<QEMVertex> vertices)
+            {
+                var v1 = vertices[edge.v1];
+                var v2 = vertices[edge.v2];
+                var Q_bar = v1.q + v2.q;
+
+                var m = new Matrix4x4(
+                    Q_bar.GetRow(0), Q_bar.GetRow(1), Q_bar.GetRow(2), new Vector4(0,0,0,1)
+                );
+
+                if (Mathf.Abs(m.determinant) > 1e-9)
+                {
+                    var m_inv = m.inverse;
+                    edge.optimalPosition = m_inv.MultiplyPoint3x4(new Vector3(-Q_bar.m03, -Q_bar.m13, -Q_bar.m23));
+                }
+                else
+                {
+                    edge.optimalPosition = (v1.position + v2.position) / 2f;
+                }
+
+                var p = new Vector4(edge.optimalPosition.x, edge.optimalPosition.y, edge.optimalPosition.z, 1);
+                edge.cost = Vector4.Dot(Q_bar * p, p);
+            }
+        }
+
+        /// <summary>
+        /// Segments the mesh surface into clusters of similar faces.
+        /// This is used by CoACD to identify flat and smooth patches for more intelligent splitting.
+        /// </summary>
+        public static class FeatureClusterer
+        {
+            public static void Cluster(MeshData mesh, float normalThresholdDegrees = 15f)
+            {
+                if (!mesh.hasHalfEdgeData)
+                {
+                    mesh.BuildHalfEdgeStructure();
+                }
+
+                mesh.faceClusterIds = new List<int>(new int[mesh.heFaces.Count]);
+                int clusterId = 1;
+                float cosThreshold = Mathf.Cos(normalThresholdDegrees * Mathf.Deg2Rad);
+
+                for (int i = 0; i < mesh.heFaces.Count; i++)
+                {
+                    if (mesh.faceClusterIds[i] == 0) // Not yet clustered
+                    {
+                        var seedFace = mesh.heFaces[i];
+                        var clusterNormal = seedFace.normal;
+
+                        var queue = new Queue<MeshFace>();
+                        queue.Enqueue(seedFace);
+                        mesh.faceClusterIds[seedFace.index] = clusterId;
+
+                        while (queue.Count > 0)
+                        {
+                            var currentFace = queue.Dequeue();
+
+                            var edge = currentFace.edge;
+                            do
+                            {
+                                var neighborFace = edge.twin?.face;
+                                if (neighborFace != null && neighborFace.index < mesh.faceClusterIds.Count && mesh.faceClusterIds[neighborFace.index] == 0)
+                                {
+                                    if (Vector3.Dot(neighborFace.normal, clusterNormal) >= cosThreshold)
+                                    {
+                                        mesh.faceClusterIds[neighborFace.index] = clusterId;
+                                        queue.Enqueue(neighborFace);
+                                    }
+                                }
+                                edge = edge.next;
+                            } while (edge != currentFace.edge);
+                        }
+                        clusterId++;
+                    }
+                }
+            }
+        }
+
         /// <summary>
         /// Utility for splitting a MeshData object by a plane.
         /// </summary>
@@ -4219,7 +4688,10 @@ namespace Empart.EmberPart
         [Header("Debug")]
         public bool enableInteractiveMode = false;
         public bool showRegionBounds = true;
+        public bool showHeatmap = false;
+        public Material debugMaterial;
         private MeshData combinedMesh;
+        private List<float> perVertexError;
         private List<ConvexHull> hulls = new List<ConvexHull>();
         private bool isProcessing = false;
         private static bool enableDetailedLoggingStatic = false; // Static for class-wide logging
@@ -4335,7 +4807,7 @@ namespace Empart.EmberPart
             // Flatten list
             foreach (var list in regionHulls) hulls.AddRange(list);
             MergeHulls();
-            MergeHulls();
+            MakeHullsWatertight();
             CreateHullObjects();
             CalculateMetrics();
             metrics.totalTime = Time.realtimeSinceStartup - startTime;
@@ -4344,81 +4816,121 @@ namespace Empart.EmberPart
         }
         private List<ConvexHull> DecomposeRegion(MeshData regionMesh, int budget, float tolerance)
         {
+            // --- CoACD Pre-processing ---
+            // 1. Decimate the mesh to a reasonable complexity for faster processing
+            int targetTris = Mathf.Clamp(regionMesh.triangleCount / 2, 1000, 20000);
+            MeshDecimator.Decimate(regionMesh, targetTris);
+            regionMesh.BuildHalfEdgeStructure();
+            regionMesh.CalculateNormals();
+
+            // 2. Perform feature clustering
+            FeatureClusterer.Cluster(regionMesh, 25f);
+
             var finalHulls = new List<ConvexHull>();
-            var processQueue = new MaxPQ<(MeshData, float)>();
-            if (regionMesh.vertices.Count < 4) return finalHulls;
-            processQueue.Enqueue((regionMesh, CalculateConcavity(regionMesh, null)));
-            while (processQueue.Count > 0 && finalHulls.Count < budget)
+            var processQueue = new MaxPQ<MeshData>();
+            processQueue.Enqueue(regionMesh, CalculateGeometricConcavity(regionMesh, null));
+
+            int iterations = 0;
+            const int maxIterations = 100; // Safety break
+
+            while(processQueue.Count > 0 && finalHulls.Count < budget && iterations < maxIterations)
             {
-                processQueue.TryDequeue(out var(currentMesh, currentConcavity), out _);
+                var currentMesh = processQueue.Dequeue();
                 if (currentMesh.vertices.Count < 4) continue;
-                // 1. Generate convex hull for the current mesh part
+
+                // --- CoACD Core Loop ---
+                // 1. Generate convex hull for the current part
                 var hull = QuickHullImplementation.ComputeConvexHullFromPoints(currentMesh.vertices);
                 if (hull.vertices.Count < 4) continue;
                 hull.BuildPlanes();
-                // 2. Calculate concavity using voxel/SDF
+                hull.sourceMesh = currentMesh;
+
+                // 2. Calculate concavity and check termination condition
                 float concavity = CalculateConcavity(currentMesh, hull);
-                // 3. Check termination condition
                 if (concavity < tolerance)
                 {
                     finalHulls.Add(hull);
                     continue;
                 }
-                // 4. If concavity is too high, find best split plane
+
+                // 3. Find the best split plane using CoACD's feature-aware evaluation
                 var (splitNormal, splitPoint) = SplitPlaneEvaluator.FindBestSplitPlane(currentMesh, hull, concavity);
                 var splitPlane = new PlaneF { n = splitNormal, d = -Vector3.Dot(splitNormal, splitPoint) };
-                // 5. Split the mesh
+
+                // 4. Split the mesh
                 MeshSplitter.Split(currentMesh, splitPlane, out MeshData positiveSide, out MeshData negativeSide);
-                // 6. Add new parts back to the queue with concavity priority
+
+                // 5. Refine the split boundary (placeholder for now, will be implemented next)
+                RefineSplitBoundary(positiveSide, negativeSide, splitPlane);
+
+                // 6. Add new parts back to the queue
                 if (positiveSide.vertices.Count > 3)
                 {
-                    positiveSide.Voxelize(settings.voxelSize, settings.voxelizationStrategy);
-                    positiveSide.ComputeSDF();
-                    float posConcavity = CalculateConcavity(positiveSide, null);
-                    processQueue.Enqueue((positiveSide, posConcavity));
+                    processQueue.Enqueue(positiveSide, CalculateGeometricConcavity(positiveSide, null));
                 }
                 if (negativeSide.vertices.Count > 3)
                 {
-                    negativeSide.Voxelize(settings.voxelSize, settings.voxelizationStrategy);
-                    negativeSide.ComputeSDF();
-                    float negConcavity = CalculateConcavity(negativeSide, null);
-                    processQueue.Enqueue((negativeSide, negConcavity));
+                    processQueue.Enqueue(negativeSide, CalculateGeometricConcavity(negativeSide, null));
                 }
+                iterations++;
             }
-            // Add any remaining parts from the queue as hulls if budget is exceeded
+
+            // Add any remaining parts from the queue as hulls
             while (processQueue.Count > 0)
             {
-                processQueue.TryDequeue(out var(mesh, _), out _);
+                var mesh = processQueue.Dequeue();
                 if (mesh.vertices.Count > 3)
                 {
                     finalHulls.Add(QuickHullImplementation.ComputeConvexHullFromPoints(mesh.vertices));
                 }
             }
+
             return finalHulls;
         }
+
+        // This is a placeholder for a more advanced boundary refinement.
+        // A full implementation would require a more sophisticated local error metric
+        // and careful handling of mesh topology.
+        private void RefineSplitBoundary(MeshData meshA, MeshData meshB, PlaneF splitPlane)
+        {
+            // Placeholder - this is a complex task that requires more than a simple fix.
+        }
         private float CalculateConcavity(MeshData mesh, ConvexHull hull)
+        {
+            return CalculateGeometricConcavity(mesh, hull);
+        }
+
+        private float CalculateGeometricConcavity(MeshData mesh, ConvexHull hull, int sampleCount = 100)
         {
             if (hull == null)
             {
                 hull = QuickHullImplementation.ComputeConvexHullFromPoints(mesh.vertices);
             }
-            // Use SDF/voxel-based concavity
-            float maxConcavity = 0f;
-            float averageConcavity = 0f;
+            if (hull.vertices.Count < 4) return 0;
+
+            var samples = ErrorCalculator.SampleMeshSurface(mesh, sampleCount, SamplingStrategy.AreaWeighted);
+            if(samples.Count == 0) return 0;
+
+            float totalDistance = 0;
+            float maxDistance = 0;
             int outsideCount = 0;
-            for (int idx = 0; idx < mesh.sdfValues.Length; idx++)
+
+            foreach(var p in samples)
             {
-                int3 coord = new int3(idx % mesh.voxelDimensions.x, (idx / mesh.voxelDimensions.x) % mesh.voxelDimensions.y, idx / (mesh.voxelDimensions.x * mesh.voxelDimensions.y));
-                Vector3 voxelPos = mesh.VoxelToWorld(coord);
-                if (!hull.ContainsPoint(voxelPos) && mesh.sdfValues[idx] < 0) // Outside hull but inside mesh
+                if(!hull.ContainsPoint(p))
                 {
-                    float dist = hull.DistanceToPoint(voxelPos);
-                    maxConcavity = Mathf.Max(maxConcavity, dist);
-                    averageConcavity += dist;
+                    float dist = hull.DistanceToPoint(p);
+                    totalDistance += dist;
+                    maxDistance = Mathf.Max(maxDistance, dist);
                     outsideCount++;
                 }
             }
-            return outsideCount > 0 ? averageConcavity / outsideCount : 0f; // Weighted average
+
+            if (outsideCount == 0) return 0;
+
+            float averageDistance = totalDistance / outsideCount;
+            // A weighted metric considering both average and max error gives a good sense of overall concavity.
+            return averageDistance * 0.8f + maxDistance * 0.2f;
         }
         private void MergeHulls()
         {
@@ -4435,9 +4947,8 @@ namespace Empart.EmberPart
                         {
                             var merged = MeshBooleanOperations.BooleanUnion(hulls[i], hulls[j]);
                             var hullMesh = new MeshData { vertices = merged.vertices, indices = merged.indices };
-                            hullMesh.Voxelize(settings.voxelSize, settings.voxelizationStrategy);
-                            hullMesh.ComputeSDF();
-                            float mergedConcavity = CalculateConcavity(hullMesh, merged);
+                            // No need to voxelize for this check, a geometric one is better
+                            float mergedConcavity = CalculateGeometricConcavity(hullMesh, merged);
                             if (mergedConcavity < settings.mergeConcavityThreshold)
                             {
                                 hulls.RemoveAt(j);
@@ -4452,6 +4963,68 @@ namespace Empart.EmberPart
                 mergeIterations++;
             }
             metrics.mergeEfficiency = (float)metrics.successfulMerges / hulls.Count;
+        }
+
+        private void MakeHullsWatertight()
+        {
+            // This is a complex post-processing step.
+            // The goal is to eliminate T-junctions and gaps between adjacent hulls.
+            // A simplified approach:
+            // 1. Find all pairs of adjacent hulls.
+            // 2. For each pair, find vertices on the boundary of one hull that are close to the other.
+            // 3. Project these vertices onto the surface of the other hull.
+
+            var adjacency = new Dictionary<int, List<int>>();
+            for(int i=0; i<hulls.Count; ++i)
+            {
+                adjacency[i] = new List<int>();
+                for(int j=0; j<hulls.Count; ++j)
+                {
+                    if (i == j) continue;
+                    if(hulls[i].bounds.Intersects(hulls[j].bounds))
+                    {
+                        adjacency[i].Add(j);
+                    }
+                }
+            }
+
+            float snapDistance = settings.voxelSize;
+
+            for(int i=0; i<hulls.Count; ++i)
+            {
+                var hullA = hulls[i];
+                foreach(var neighborIdx in adjacency[i])
+                {
+                    var hullB = hulls[neighborIdx];
+                    for(int v_idx = 0; v_idx < hullA.vertices.Count; ++v_idx)
+                    {
+                        float dist = hullB.DistanceToPoint(hullA.vertices[v_idx]);
+                        if(dist < snapDistance)
+                        {
+                            // Project vertex v_idx of hullA onto the closest point on hullB's surface
+                            // This requires finding the closest point, which is non-trivial.
+                            // For simplicity, we can snap to the closest vertex on hullB if it's close enough.
+                            float minNeighborDist = float.MaxValue;
+                            int closestNeighborVert = -1;
+                            for(int nv_idx = 0; nv_idx < hullB.vertices.Count; ++nv_idx)
+                            {
+                                float d = Vector3.Distance(hullA.vertices[v_idx], hullB.vertices[nv_idx]);
+                                if(d < minNeighborDist)
+                                {
+                                    minNeighborDist = d;
+                                    closestNeighborVert = nv_idx;
+                                }
+                            }
+                            if(closestNeighborVert != -1 && minNeighborDist < snapDistance)
+                            {
+                                hullA.vertices[v_idx] = hullB.vertices[closestNeighborVert];
+                            }
+                        }
+                    }
+                }
+                hullA.BuildPlanes();
+                hullA.CalculateProperties();
+            }
         }
         private void CreateHullObjects()
         {
@@ -4495,6 +5068,21 @@ namespace Empart.EmberPart
                 originalMeshSurfaceArea = combinedMesh.surfaceArea
             };
             metrics.errorDistribution = ErrorCalculator.CalculateErrorDistribution(combinedMesh, hulls, 1000);
+
+            perVertexError = new List<float>(new float[combinedMesh.vertexCount]);
+            if(hulls.Count > 0)
+            {
+                for(int i=0; i<combinedMesh.vertexCount; ++i)
+                {
+                    float minError = float.MaxValue;
+                    foreach(var hull in hulls)
+                    {
+                        minError = Mathf.Min(minError, hull.DistanceToPoint(combinedMesh.vertices[i]));
+                    }
+                    perVertexError[i] = minError;
+                }
+            }
+
             metrics.hullMetrics.Clear();
             for (int i = 0; i < hulls.Count; i++)
             {
@@ -4556,6 +5144,32 @@ namespace Empart.EmberPart
                     Gizmos.matrix = transform.localToWorldMatrix;
                     Gizmos.DrawWireCube(region.AABB.center, region.AABB.size);
                 }
+            }
+
+            if (showHeatmap && combinedMesh != null && perVertexError != null && perVertexError.Count == combinedMesh.vertexCount && debugMaterial != null)
+            {
+                var meshToDraw = new Mesh
+                {
+                    vertices = combinedMesh.vertices.ToArray(),
+                    triangles = combinedMesh.indices.ToArray()
+                };
+
+                var colors = new Color[combinedMesh.vertexCount];
+                float maxError = 0;
+                if(perVertexError.Count > 0) maxError = perVertexError.Max();
+
+                if (maxError > 0)
+                {
+                    for (int i = 0; i < combinedMesh.vertexCount; i++)
+                    {
+                        float normalizedError = perVertexError[i] / maxError;
+                        colors[i] = Color.Lerp(Color.blue, Color.red, normalizedError);
+                    }
+                }
+                meshToDraw.colors = colors;
+
+                debugMaterial.SetPass(0);
+                Graphics.DrawMeshNow(meshToDraw, transform.localToWorldMatrix);
             }
         }
     }
