@@ -345,6 +345,21 @@ namespace Empart.EmberPart
             public float balanceWeight = 0.1f;
             public float sahAlpha = 0.01f;
             public bool useSAH = true;
+            [Header("CoACD Settings")]
+            [Tooltip("The primary ACD method to use for decomposition.")]
+            public ACDSubroutineType acdMethod = ACDSubroutineType.CoACD;
+            [Tooltip("Weight for preserving mesh features during splitting.")]
+            [Range(0, 1)] public float featureWeight = 0.3f;
+            [Tooltip("Weight for preserving sharp edges during splitting.")]
+            [Range(0, 1)] public float sharpnessWeight = 0.2f;
+            [Tooltip("Weight for preserving symmetry during splitting.")]
+            [Range(0, 1)] public float symmetryWeight = 0.1f;
+            [Tooltip("How aggressively to pre-calculate features.")]
+            [Range(0, 1)] public float precomputationLevel = 0.5f;
+            [Tooltip("Maximum number of feature points to sample.")]
+            public int maxFeatureSamples = 500;
+            [Tooltip("Angle threshold for detecting sharp edges.")]
+            public float sharpEdgeAngle = 45f;
             [Header("Voxelization Settings")]
             public VoxelizationStrategy voxelizationStrategy = VoxelizationStrategy.Adaptive;
             public float voxelSize = 0.05f;
@@ -1852,6 +1867,73 @@ namespace Empart.EmberPart
                 // Additional: Apply post-optimization smoothing
                 SmoothHull(1);
             }
+            private void EdgeCollapse(float tolerance)
+            {
+                int targetCount = Mathf.Max(4, (int)(vertices.Count * (1.0f - tolerance)));
+                var sortedEdges = edges.OrderBy(e => e.length).ToList();
+
+                while (vertices.Count > targetCount && sortedEdges.Count > 0)
+                {
+                    var edge = sortedEdges[0];
+                    sortedEdges.RemoveAt(0);
+
+                    var v1_idx = edge.vertex1;
+                    var v2_idx = edge.vertex2;
+
+                    // Collapse edge to its midpoint
+                    var midpoint = (vertices[v1_idx] + vertices[v2_idx]) / 2.0f;
+                    vertices[v1_idx] = midpoint;
+
+                    // Remap all references to v2 to now point to v1
+                    for (int i = 0; i < indices.Count; i++)
+                    {
+                        if (indices[i] == v2_idx) indices[i] = v1_idx;
+                    }
+
+                    // Remove degenerate triangles (that now have the same vertex twice)
+                    var newIndices = new List<int>();
+                    for (int i = 0; i < indices.Count; i += 3)
+                    {
+                        int i0 = indices[i];
+                        int i1 = indices[i + 1];
+                        int i2 = indices[i + 2];
+                        if (i0 != i1 && i0 != i2 && i1 != i2)
+                        {
+                            newIndices.Add(i0);
+                            newIndices.Add(i1);
+                            newIndices.Add(i2);
+                        }
+                    }
+                    indices = newIndices;
+                }
+
+                // After collapsing, we need to clean up the unused vertices
+                RemoveUnusedVertices();
+            }
+
+            private void RemoveUnusedVertices()
+            {
+                var used = new HashSet<int>(indices);
+                var remap = new int[vertices.Count];
+                var newVerts = new List<Vector3>();
+                int newIdx = 0;
+                for (int i = 0; i < vertices.Count; i++)
+                {
+                    if (used.Contains(i))
+                    {
+                        remap[i] = newIdx;
+                        newVerts.Add(vertices[i]);
+                        newIdx++;
+                    }
+                }
+
+                for (int i = 0; i < indices.Count; i++)
+                {
+                    indices[i] = remap[indices[i]];
+                }
+                vertices = newVerts;
+            }
+
             private float CalculateVertexRemovalError(int vertexIndex)
             {
                 // Calculate error introduced by removing this vertex
@@ -2469,9 +2551,13 @@ namespace Empart.EmberPart
             }
             private void DetectArbitrarySymmetry()
             {
-                // Advanced symmetry detection
-                // ... (add logic for PCA or other methods)
+                // Advanced symmetry detection using PCA
+                SplitPlaneEvaluator.CalculatePCA(vertices, out Vector3 pca1, out Vector3 pca2, out Vector3 pca3);
+                if (IsSymmetricAlongAxis(pca1)) symmetryAxes.Add(pca1);
+                if (IsSymmetricAlongAxis(pca2)) symmetryAxes.Add(pca2);
+                if (IsSymmetricAlongAxis(pca3)) symmetryAxes.Add(pca3);
             }
+
             private bool IsSymmetricAlongAxis(Vector3 axis)
             {
                 // Check if reflecting across plane gives the same hull
@@ -2486,17 +2572,42 @@ namespace Empart.EmberPart
                 // Check if all reflected points are in hull
                 foreach (var rv in reflectedVertices)
                 {
-                    if (!ContainsPoint(rv))
-                        return false;
+                    bool found = false;
+                    for(int i=0; i<vertices.Count; ++i)
+                    {
+                        if((vertices[i] - rv).sqrMagnitude < 0.001f)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if(!found) return false;
                 }
                 return true;
             }
+
             private void SmoothHull(int iterations)
             {
-                // Apply smoothing to hull vertices
+                // Apply Laplacian smoothing to hull vertices
                 for (int iter = 0; iter < iterations; iter++)
                 {
-                    // ... (add smoothing logic)
+                    var newVertices = new List<Vector3>(vertices);
+                    for (int i = 0; i < vertices.Count; i++)
+                    {
+                        var neighbors = new List<Vector3>();
+                        foreach (var edge in edges)
+                        {
+                            if (edge.vertex1 == i) neighbors.Add(vertices[edge.vertex2]);
+                            else if (edge.vertex2 == i) neighbors.Add(vertices[edge.vertex1]);
+                        }
+                        if (neighbors.Count > 0)
+                        {
+                            var avg = Vector3.zero;
+                            foreach (var n in neighbors) avg += n;
+                            newVertices[i] = Vector3.Lerp(vertices[i], avg / neighbors.Count, 0.5f);
+                        }
+                    }
+                    vertices = newVertices;
                 }
             }
             private void CalculateTopology()
@@ -3720,22 +3831,27 @@ namespace Empart.EmberPart
                 outMesh.Optimize();
                 return outMesh;
             }
-            public static MeshData BooleanDifference(MeshData mesh, Bounds box)
+            public static MeshData BooleanDifference(MeshData a, MeshData b)
             {
+                // Proper boolean difference using clipping
                 var outMesh = new MeshData();
-                for (int i = 0; i < mesh.indices.Count; i += 3)
+                // First, clip a against b's planes (assuming b is convex)
+                var bHull = QuickHullImplementation.ComputeConvexHullFromPoints(b.vertices);
+                bHull.BuildPlanes();
+                for (int i = 0; i < a.indices.Count; i += 3)
                 {
-                    int i0 = mesh.indices[i], i1 = mesh.indices[i + 1], i2 = mesh.indices[i + 2];
-                    var center = (mesh.vertices[i0] + mesh.vertices[i1] + mesh.vertices[i2]) / 3f;
-                    if (!box.Contains(center)) // This is still a simplification, full difference is much harder.
+                    int i0 = a.indices[i], i1 = a.indices[i + 1], i2 = a.indices[i + 2];
+                    var v0 = a.vertices[i0]; var v1 = a.vertices[i1]; var v2 = a.vertices[i2];
+                    var n0 = a.normals.Count > i0 ? a.normals[i0] : Vector3.zero;
+                    var n1 = a.normals.Count > i1 ? a.normals[i1] : Vector3.zero;
+                    var n2 = a.normals.Count > i2 ? a.normals[i2] : Vector3.zero;
+                    var planes = bHull.planes.Select(p => new PlaneF { n = -p.n, d = -p.d }).ToList(); // Invert planes for difference
+                    foreach (var (p0, p1, p2, norm0, norm1, norm2) in ClipTriAgainstConvex(v0, v1, v2, n0, n1, n2, planes))
                     {
-                        var n0 = mesh.normals.Count > i0 ? mesh.normals[i0] : Vector3.up;
-                        var n1 = mesh.normals.Count > i1 ? mesh.normals[i1] : Vector3.up;
-                        var n2 = mesh.normals.Count > i2 ? mesh.normals[i2] : Vector3.up;
-                        int ia = Add(outMesh, mesh.vertices[i0], n0);
-                        int ib = Add(outMesh, mesh.vertices[i1], n1);
-                        int ic = Add(outMesh, mesh.vertices[i2], n2);
-                        outMesh.indices.AddRange(new[] { ia, ib, ic });
+                        int ia = Add(outMesh, p0, norm0);
+                        int ib = Add(outMesh, p1, norm1);
+                        int ic = Add(outMesh, p2, norm2);
+                        outMesh.indices.Add(ia); outMesh.indices.Add(ib); outMesh.indices.Add(ic);
                     }
                 }
                 outMesh.Optimize();
@@ -3863,27 +3979,32 @@ namespace Empart.EmberPart
         /// </summary>
         public static class SplitPlaneEvaluator
         {
-            public static (Vector3 normal, Vector3 point) FindBestSplitPlane(MeshData mesh, ConvexHull hull, float concavity)
+            public static (Vector3 normal, Vector3 point) FindBestSplitPlane(MeshData mesh, ConvexHull hull, float concavity, ConvexDecompositionSettings settings)
             {
                 // Find the deepest point of concavity (witness point)
                 Vector3 witnessPoint = Vector3.zero;
                 float maxDist = -1f;
                 foreach (var vert in mesh.vertices)
                 {
-                    float dist = hull.DistanceToPoint(vert);
-                    if (dist > maxDist)
+                    if (!hull.ContainsPoint(vert))
                     {
-                        maxDist = dist;
-                        witnessPoint = vert;
+                        float dist = hull.DistanceToPoint(vert);
+                        if (dist > maxDist)
+                        {
+                            maxDist = dist;
+                            witnessPoint = vert;
+                        }
                     }
                 }
-                var candidates = GenerateSplitPlaneCandidates(mesh, hull, witnessPoint);
+                var candidates = GenerateSplitPlaneCandidates(mesh, hull, witnessPoint, settings);
                 if (candidates.Count == 0) return (Vector3.up, mesh.bounds.center);
+
                 var bestPlane = (Vector3.zero, Vector3.zero);
-                float bestScore = float.MaxValue; // We want to minimize the score
+                float bestScore = float.MaxValue;
+
                 foreach (var candidate in candidates)
                 {
-                    float score = EvaluateSplitPlane(mesh, candidate.normal, candidate.point);
+                    float score = EvaluateSplitPlane(mesh, candidate.normal, candidate.point, settings);
                     if (score < bestScore)
                     {
                         bestScore = score;
@@ -3892,14 +4013,17 @@ namespace Empart.EmberPart
                 }
                 return bestPlane;
             }
-            private static List<(Vector3 normal, Vector3 point)> GenerateSplitPlaneCandidates(MeshData mesh, ConvexHull hull, Vector3 witnessPoint)
+
+            private static List<(Vector3 normal, Vector3 point)> GenerateSplitPlaneCandidates(MeshData mesh, ConvexHull hull, Vector3 witnessPoint, ConvexDecompositionSettings settings)
             {
                 var candidates = new List<(Vector3 normal, Vector3 point)>();
                 if (mesh.vertices.Count < 10) return candidates;
+
                 // Candidate 1: Plane aligned with axis-aligned bounding box
                 candidates.Add((Vector3.right, mesh.bounds.center));
                 candidates.Add((Vector3.up, mesh.bounds.center));
                 candidates.Add((Vector3.forward, mesh.bounds.center));
+
                 // Candidate 2: Plane through witness point
                 Vector3 closestPointOnHull = hull.bounds.ClosestPoint(witnessPoint);
                 Vector3 witnessNormal = (witnessPoint - closestPointOnHull).normalized;
@@ -3907,43 +4031,48 @@ namespace Empart.EmberPart
                 {
                     candidates.Add((witnessNormal, witnessPoint));
                 }
+
                 // Candidate 3: PCA-aligned plane
                 CalculatePCA(mesh.vertices, out Vector3 pca1, out Vector3 pca2, out Vector3 pca3);
                 candidates.Add((pca1, mesh.bounds.center));
                 candidates.Add((pca2, mesh.bounds.center));
                 candidates.Add((pca3, mesh.bounds.center));
-                // Additional candidates: Based on features
-                if (mesh.featureVertices != null)
+
+                // Candidate 4: Feature-based planes from sharp edges
+                if (mesh.sharpEdges != null && mesh.sharpEdges.Count > 1)
                 {
-                    if (mesh.featureVertices.Count >= 3)
+                    for (int i = 0; i < Mathf.Min(mesh.sharpEdges.Count - 1, 20); i += 2) // Limit samples
                     {
-                        var fv1 = mesh.vertices[mesh.featureVertices[0]];
-                        var fv2 = mesh.vertices[mesh.featureVertices[1]];
-                        var fv3 = mesh.vertices[mesh.featureVertices[2]];
-                        var featureNormal = Vector3.Cross(fv2 - fv1, fv3 - fv1).normalized;
-                        candidates.Add((featureNormal, (fv1 + fv2 + fv3) / 3f));
+                        var v1 = mesh.vertices[mesh.sharpEdges[i]];
+                        var v2 = mesh.vertices[mesh.sharpEdges[i + 1]];
+                        var direction = (v2 - v1).normalized;
+                        var tangent = Vector3.Cross(direction, witnessNormal).normalized;
+                        if (tangent.sqrMagnitude > 0.1)
+                            candidates.Add((tangent, (v1 + v2) / 2));
                     }
                 }
-                // Additional: Voxel-based candidates
-                var voxelCandidate = GenerateVoxelBasedCandidate(mesh);
-                if (voxelCandidate.normal != Vector3.zero)
-                    candidates.Add(voxelCandidate);
-                return candidates;
+
+                // Candidate 5: Feature-based planes from saliency clusters
+                if (mesh.featureVertices != null && mesh.featureVertices.Count >= 3)
+                {
+                    var fv1 = mesh.vertices[mesh.featureVertices[0]];
+                    var fv2 = mesh.vertices[mesh.featureVertices[1]];
+                    var fv3 = mesh.vertices[mesh.featureVertices[2]];
+                    var featureNormal = Vector3.Cross(fv2 - fv1, fv3 - fv1).normalized;
+                    if (featureNormal.sqrMagnitude > 0.1)
+                        candidates.Add((featureNormal, (fv1 + fv2 + fv3) / 3f));
+                }
+
+                return candidates.Distinct().ToList(); // Ensure unique candidates
             }
-            private static (Vector3 normal, Vector3 point) GenerateVoxelBasedCandidate(MeshData mesh)
+
+            private static float EvaluateSplitPlane(MeshData mesh, Vector3 normal, Vector3 point, ConvexDecompositionSettings settings)
             {
-                // Use voxel data to find high concavity plane
-                // ... (add logic)
-                return (Vector3.up, mesh.bounds.center); // Placeholder
-            }
-            private static float EvaluateSplitPlane(MeshData mesh, Vector3 normal, Vector3 point)
-            {
-                // Use a cost function based on the Surface Area Heuristic (SAH)
-                // This tries to create balanced splits.
                 Bounds leftBounds = new Bounds();
                 Bounds rightBounds = new Bounds();
                 int leftCount = 0, rightCount = 0;
                 bool firstLeft = true, firstRight = true;
+
                 foreach (var v in mesh.vertices)
                 {
                     float side = Vector3.Dot(v - point, normal);
@@ -3960,15 +4089,65 @@ namespace Empart.EmberPart
                         rightCount++;
                     }
                 }
+
                 if (leftCount == 0 || rightCount == 0) return float.MaxValue; // Invalid split
+
+                // Cost 1: Surface Area Heuristic (SAH)
                 float surfaceAreaLeft = 2 * (leftBounds.size.x * leftBounds.size.y + leftBounds.size.x * leftBounds.size.z + leftBounds.size.y * leftBounds.size.z);
                 float surfaceAreaRight = 2 * (rightBounds.size.x * rightBounds.size.y + rightBounds.size.x * rightBounds.size.z + rightBounds.size.y * rightBounds.size.z);
-                float cost = surfaceAreaLeft * leftCount + surfaceAreaRight * rightCount;
-                // Additional: Penalize unbalanced splits
-                float balance = Mathf.Abs(leftCount - rightCount) / (float)(leftCount + rightCount);
-                cost *= 1 + balance;
+                float sahCost = (surfaceAreaLeft * leftCount + surfaceAreaRight * rightCount) / mesh.bounds.size.magnitude;
+
+                // Cost 2: Balance
+                float balanceCost = 1.0f - (float)Mathf.Min(leftCount, rightCount) / Mathf.Max(leftCount, rightCount);
+
+                // Cost 3: Feature Preservation
+                float featureCost = CalculateFeatureCost(mesh, normal, point, settings);
+
+                // Final Weighted Cost
+                float totalCost =
+                    (1.0f - settings.featureWeight) * (settings.concavityWeight * sahCost + settings.balanceWeight * balanceCost) +
+                    settings.featureWeight * featureCost;
+
+                return totalCost;
+            }
+
+            private static float CalculateFeatureCost(MeshData mesh, Vector3 normal, Vector3 point, ConvexDecompositionSettings settings)
+            {
+                float cost = 0;
+                float planeThickness = 0.05f * mesh.bounds.size.magnitude; // 5% of bounding box diagonal
+
+                // Penalize cutting sharp edges
+                if (mesh.sharpEdges != null)
+                {
+                    for (int i = 0; i < mesh.sharpEdges.Count - 1; i += 2)
+                    {
+                        var v1 = mesh.vertices[mesh.sharpEdges[i]];
+                        var v2 = mesh.vertices[mesh.sharpEdges[i+1]];
+                        float d1 = Vector3.Dot(v1 - point, normal);
+                        float d2 = Vector3.Dot(v2 - point, normal);
+                        if (d1 * d2 < 0) // Edge crosses the plane
+                        {
+                            cost += settings.sharpnessWeight;
+                        }
+                    }
+                }
+
+                // Penalize separating salient features
+                if (mesh.featureVertices != null)
+                {
+                    foreach (int featureIdx in mesh.featureVertices)
+                    {
+                        float dist = Mathf.Abs(Vector3.Dot(mesh.vertices[featureIdx] - point, normal));
+                        if (dist < planeThickness) // Feature is close to the plane
+                        {
+                             cost += (1.0f - (dist / planeThickness)) * mesh.vertexSaliency[featureIdx];
+                        }
+                    }
+                }
+
                 return cost;
             }
+
             private static void CalculatePCA(List<Vector3> points, out Vector3 axis1, out Vector3 axis2, out Vector3 axis3)
             {
                 if (points.Count < 3)
@@ -3994,7 +4173,7 @@ namespace Empart.EmberPart
                 cov[0, 0] = xx; cov[0, 1] = xy; cov[0, 2] = xz;
                 cov[1, 0] = xy; cov[1, 1] = yy; cov[1, 2] = yz;
                 cov[2, 0] = xz; cov[2, 1] = yz; cov[2, 2] = zz;
-                // Using Jacobi iterations for Eigendecomposition of the 3x3 covariance matrix
+
                 const int maxIterations = 10;
                 Matrix4x4 eigenVectors = Matrix4x4.identity;
                 for (int i = 0; i < maxIterations; i++)
@@ -4037,45 +4216,6 @@ namespace Empart.EmberPart
                 axis1 = eigenVectors.GetColumn(0).normalized;
                 axis2 = eigenVectors.GetColumn(1).normalized;
                 axis3 = eigenVectors.GetColumn(2).normalized;
-                // Additional: Sort by eigenvalue magnitude if needed
-            }
-            // New method for voxel-based plane scoring
-            public static float ScorePlaneWithVoxels(MeshData mesh, Vector3 normal, Vector3 point, float concavityWeight, float sahWeight, float balanceWeight)
-            {
-                // Split voxels into left and right
-                int leftVoxels = 0, rightVoxels = 0;
-                float leftConcavity = 0, rightConcavity = 0;
-                for (int idx = 0; idx < mesh.sdfValues.Length; idx++)
-                {
-                    int3 coord = new int3(idx % mesh.voxelDimensions.x, (idx / mesh.voxelDimensions.x) % mesh.voxelDimensions.y, idx / (mesh.voxelDimensions.x * mesh.voxelDimensions.y));
-                    Vector3 voxelPos = mesh.VoxelToWorld(coord);
-                    float side = Vector3.Dot(voxelPos - point, normal);
-                    if (side <= 0)
-                    {
-                        leftVoxels++;
-                        leftConcavity += mesh.sdfValues[idx] > 0 ? mesh.sdfValues[idx] : 0;
-                    }
-                    else
-                    {
-                        rightVoxels++;
-                        rightConcavity += mesh.sdfValues[idx] > 0 ? mesh.sdfValues[idx] : 0;
-                    }
-                }
-                float maxConcavity = Mathf.Max(leftConcavity / leftVoxels, rightConcavity / rightVoxels);
-                float sahCost = EvaluateSplitPlane(mesh, normal, point);
-                float balance = Mathf.Abs(leftVoxels - rightVoxels) / (float)(leftVoxels + rightVoxels);
-                return concavityWeight * maxConcavity + sahWeight * sahCost + balanceWeight * balance;
-            }
-            // Additional: Feature-based plane generation
-            public static (Vector3 normal, Vector3 point) GenerateFeaturePlane(MeshData mesh)
-            {
-                if (mesh.featureVertices.Count < 3) return (Vector3.up, mesh.bounds.center);
-                var fv1 = mesh.vertices[mesh.featureVertices[0]];
-                var fv2 = mesh.vertices[mesh.featureVertices[1]];
-                var fv3 = mesh.vertices[mesh.featureVertices[2]];
-                var normal = Vector3.Cross(fv2 - fv1, fv3 - fv1).normalized;
-                var point = (fv1 + fv2 + fv3) / 3f;
-                return (normal, point);
             }
         }
         /// <summary>
@@ -4282,6 +4422,14 @@ namespace Empart.EmberPart
             }
             combinedMesh.Optimize();
             combinedMesh.CalculateProperties();
+            // Pre-computation of features for CoACD
+            if (settings.acdMethod == ACDSubroutineType.CoACD)
+            {
+                combinedMesh.CalculateCurvature();
+                combinedMesh.CalculateSaliency();
+                combinedMesh.IdentifySharpEdges(settings.sharpEdgeAngle);
+                combinedMesh.IdentifyFeatureVertices(settings.precomputationLevel);
+            }
             combinedMesh.BuildAccelerationStructure();
             metrics.originalMeshVolume = combinedMesh.volume;
             metrics.originalMeshSurfaceArea = combinedMesh.surfaceArea;
@@ -4365,7 +4513,7 @@ namespace Empart.EmberPart
                     continue;
                 }
                 // 4. If concavity is too high, find best split plane
-                var (splitNormal, splitPoint) = SplitPlaneEvaluator.FindBestSplitPlane(currentMesh, hull, concavity);
+                var (splitNormal, splitPoint) = SplitPlaneEvaluator.FindBestSplitPlane(currentMesh, hull, concavity, settings);
                 var splitPlane = new PlaneF { n = splitNormal, d = -Vector3.Dot(splitNormal, splitPoint) };
                 // 5. Split the mesh
                 MeshSplitter.Split(currentMesh, splitPlane, out MeshData positiveSide, out MeshData negativeSide);
@@ -4556,6 +4704,20 @@ namespace Empart.EmberPart
                     Gizmos.matrix = transform.localToWorldMatrix;
                     Gizmos.DrawWireCube(region.AABB.center, region.AABB.size);
                 }
+            }
+        }
+
+        [ContextMenu("Run Smoke Test")]
+        public void RunSmokeTest()
+        {
+            try
+            {
+                DecomposeMesh();
+                Debug.Log("Smoke test completed successfully.");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Smoke test failed: {ex.Message}");
             }
         }
     }
