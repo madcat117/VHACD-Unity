@@ -530,8 +530,6 @@ namespace Empart.EmberPart
             [Header("Voxelization Method")]
             [Tooltip("The primary method for generating the voxel representation.")]
             public VoxelizationMethod voxelMethod = VoxelizationMethod.CPU_Solid;
-            [Tooltip("The compute shader for GPU-accelerated voxelization and SDF generation.")]
-            public ComputeShader voxelizationShader;
 
             /// <summary>The algorithm used for generating the Signed Distance Field (SDF).</summary>
             public enum SDFGenerationMethod
@@ -1591,7 +1589,7 @@ namespace Empart.EmberPart
 
                 if (settings.voxelMethod == ConvexDecompositionSettings.VoxelizationMethod.GPU_Accelerated)
                 {
-                    GpuVoxelizer.Voxelize(this, settings.voxelizationShader, settings.enableSDF);
+                    GpuVoxelizer.Voxelize(this, settings.enableSDF);
                 }
                 else
                 {
@@ -4852,6 +4850,194 @@ namespace Empart.EmberPart
 
         public static class GpuVoxelizer
         {
+            private const string VoxelizerShaderSource = @"
+#pragma kernel Clear
+#pragma kernel VoxelizeSurface
+#pragma kernel Solidify
+#pragma kernel JFA_Seed
+#pragma kernel JFA_Pass
+#pragma kernel FinalizeSDF
+// Buffers
+RWStructuredBuffer<float> g_Voxels; // Will store the final SDF
+RWStructuredBuffer<int3> g_JFAGrid; // Stores the xyz coordinate of the closest seed
+StructuredBuffer<float3> g_Vertices;
+StructuredBuffer<int3> g_Indices;
+// Uniforms
+int g_TriangleCount;
+int3 g_VoxelDimensions;
+float3 g_VoxelBoundsMin;
+float3 g_VoxelBoundsSize;
+int g_JfaStep;
+// ==================================================================================
+// Separating Axis Theorem (SAT) for Triangle-AABB Intersection
+// ==================================================================================
+bool test_axis(float3 axis, float3 v0, float3 v1, float3 v2, float3 box_half_size)
+{
+    float p0 = dot(axis, v0);
+    float p1 = dot(axis, v1);
+    float p2 = dot(axis, v2);
+    float r = box_half_size.x * abs(axis.x) + box_half_size.y * abs(axis.y) + box_half_size.z * abs(axis.z);
+    float min_p = min(p0, min(p1, p2));
+    float max_p = max(p0, max(p1, p2));
+    return max_p >= -r && min_p <= r;
+}
+bool TriangleAABBOverlap(float3 v0, float3 v1, float3 v2, float3 box_center, float3 box_half_size)
+{
+    v0 -= box_center;
+    v1 -= box_center;
+    v2 -= box_center;
+    float3 f0 = v1 - v0;
+    float3 f1 = v2 - v1;
+    float3 f2 = v0 - v2;
+    if (!test_axis(float3(1, 0, 0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(float3(0, 1, 0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(float3(0, 0, 1), v0, v1, v2, box_half_size)) return false;
+    float3 tri_normal = cross(f0, f1);
+    if (!test_axis(tri_normal, v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(1, 0, 0), f0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(1, 0, 0), f1), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(1, 0, 0), f2), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 1, 0), f0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 1, 0), f1), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 1, 0), f2), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 0, 1), f0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 0, 1), f1), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 0, 1), f2), v0, v1, v2, box_half_size)) return false;
+    return true;
+}
+// ==================================================================================
+[numthreads(8,8,8)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index < g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z)
+    {
+        g_Voxels[index] = 1.0;
+    }
+}
+[numthreads(64,1,1)]
+void VoxelizeSurface (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_TriangleCount) return;
+    int3 tri = g_Indices[id.x];
+    float3 v0 = g_Vertices[tri.x];
+    float3 v1 = g_Vertices[tri.y];
+    float3 v2 = g_Vertices[tri.z];
+    float3 minP = min(v0, min(v1, v2));
+    float3 maxP = max(v0, max(v1, v2));
+    float3 voxel_size = g_VoxelBoundsSize / g_VoxelDimensions;
+    int3 minCoord = max(int3(0,0,0), (int3)floor((minP - g_VoxelBoundsMin) / voxel_size));
+    int3 maxCoord = min(g_VoxelDimensions - 1, (int3)ceil((maxP - g_VoxelBoundsMin) / voxel_size));
+    for (int z = minCoord.z; z <= maxCoord.z; z++)
+    {
+        for (int y = minCoord.y; y <= maxCoord.y; y++)
+        {
+            for (int x = minCoord.x; x <= maxCoord.x; x++)
+            {
+                float3 voxelCenter = g_VoxelBoundsMin + (float3(x,y,z) + 0.5) * voxel_size;
+                float3 voxelHalfSize = voxel_size * 0.5;
+                if (TriangleAABBOverlap(v0, v1, v2, voxelCenter, voxelHalfSize))
+                {
+                    uint index = x + y * g_VoxelDimensions.x + z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+                    g_Voxels[index] = -1.0;
+                }
+            }
+        }
+    }
+}
+[numthreads(8,8,1)]
+void Solidify (uint3 id : SV_DispatchThreadID)
+{
+    uint x = id.x;
+    uint y = id.y;
+    if (x >= g_VoxelDimensions.x || y >= g_VoxelDimensions.y) return;
+    bool inside = false;
+    for (uint z = 0; z < g_VoxelDimensions.z; z++)
+    {
+        uint index = x + y * g_VoxelDimensions.x + z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+        if (g_Voxels[index] < 0)
+        {
+            inside = !inside;
+        }
+        if (inside)
+        {
+             g_Voxels[index] = -1.0;
+        }
+    }
+}
+[numthreads(8,8,8)]
+void JFA_Seed(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
+    if (g_Voxels[index] < 0) {
+        g_JFAGrid[index] = id.xyz; // This is a surface voxel, so it is its own seed.
+    } else {
+        g_JFAGrid[index] = int3(-1, -1, -1); // Mark as unseeded.
+    }
+}
+[numthreads(8,8,8)]
+void JFA_Pass(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
+    int3 p = id.xyz;
+    int3 best_seed = g_JFAGrid[index];
+    float min_dist_sq = 1e20;
+    if (best_seed.x != -1)
+    {
+        min_dist_sq = dot(p - best_seed, p - best_seed);
+    }
+    // Sample neighbors in a 3x3x3 grid at the current step size
+    for (int z = -1; z <= 1; ++z)
+    {
+        for (int y = -1; y <= 1; ++y)
+        {
+            for (int x = -1; x <= 1; ++x)
+            {
+                int3 neighbor_p = p + int3(x, y, z) * g_JfaStep;
+                if (all(neighbor_p >= 0) && all(neighbor_p < g_VoxelDimensions))
+                {
+                    uint neighbor_idx = neighbor_p.x + neighbor_p.y * g_VoxelDimensions.x + neighbor_p.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+                    int3 neighbor_seed = g_JFAGrid[neighbor_idx];
+                    if (neighbor_seed.x != -1)
+                    {
+                        float dist_sq = dot(p - neighbor_seed, p - neighbor_seed);
+                        if (dist_sq < min_dist_sq)
+                        {
+                            min_dist_sq = dist_sq;
+                            best_seed = neighbor_seed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    g_JFAGrid[index] = best_seed;
+}
+[numthreads(8,8,8)]
+void FinalizeSDF (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
+    int3 seed = g_JFAGrid[index];
+    if (seed.x != -1)
+    {
+        float3 voxel_size = g_VoxelBoundsSize / g_VoxelDimensions;
+        float3 p_world = g_VoxelBoundsMin + (id.xyz + 0.5) * voxel_size;
+        float3 seed_world = g_VoxelBoundsMin + (seed + 0.5) * voxel_size;
+        float dist = length(p_world - seed_world);
+        // Apply sign based on the solidification pass result (stored in g_Voxels)
+        g_Voxels[index] = (g_Voxels[index] < 0) ? -dist : dist;
+    }
+    else
+    {
+        // Should not happen if JFA is complete, but as a fallback, mark as far away.
+        g_Voxels[index] = g_VoxelBoundsSize.x;
+    }
+}
+";
+            private static ComputeShader _voxelizerShader;
             // Kernels
             private static int _kernelClear;
             private static int _kernelVoxelize;
@@ -4859,17 +5045,51 @@ namespace Empart.EmberPart
             private static int _kernelJfaSeed;
             private static int _kernelJfaPass;
             private static int _kernelFinalizeSdf;
-
             // Buffers
             private static ComputeBuffer _vertexBuffer;
             private static ComputeBuffer _indexBuffer;
             private static ComputeBuffer _voxelBuffer; // Stores solid voxelization (temp) and final SDF
             private static ComputeBuffer _jfaGridBuffer; // Stores seed coordinates
-
-            public static void Voxelize(MeshData mesh, ComputeShader shader, bool generateSdf)
+#if UNITY_EDITOR
+            private static ComputeShader GetOrCreateVoxelizerShader()
             {
-                if (shader == null) { Debug.LogError("Voxelization Compute Shader is not assigned."); return; }
+                if (_voxelizerShader == null)
+                {
+                    // Attempt to find a pre-compiled shader from resources first
+                    _voxelizerShader = Resources.FindObjectsOfTypeAll<ComputeShader>().FirstOrDefault(cs => cs.name == "VoxelizerInternal");
 
+                    if (_voxelizerShader == null)
+                    {
+                        // As a fallback, create the shader entirely in memory without creating assets
+                        _voxelizerShader = new ComputeShader();
+                        _voxelizerShader.name = "VoxelizerInternal";
+                        _voxelizerShader.hideFlags = HideFlags.HideAndDontSave; // In-memory only
+
+                        // Unity does not have a public API to create a shader from a string directly.
+                        // The asset pipeline is required. We create it in a temp location and load it.
+                        string tempPath = "Assets/VoxelizerInternal_Temp.compute";
+                        File.WriteAllText(tempPath, VoxelizerShaderSource);
+                        AssetDatabase.ImportAsset(tempPath);
+                        _voxelizerShader = AssetDatabase.LoadAssetAtPath<ComputeShader>(tempPath);
+                        AssetDatabase.DeleteAsset(tempPath); // Clean up immediately
+                    }
+                }
+                return _voxelizerShader;
+            }
+#endif
+            public static void Voxelize(MeshData mesh, bool generateSdf)
+            {
+#if UNITY_EDITOR
+                ComputeShader shader = GetOrCreateVoxelizerShader();
+                if (shader == null)
+                {
+                    Debug.LogError("Failed to create internal voxelization compute shader.");
+                    return;
+                }
+#else
+                Debug.LogError("GPU Voxelization is only supported in the Unity Editor in this version.");
+                return;
+#endif
                 // 1. Find all necessary kernels
                 _kernelClear = shader.FindKernel("Clear");
                 _kernelVoxelize = shader.FindKernel("VoxelizeSurface");
@@ -4880,17 +5100,14 @@ namespace Empart.EmberPart
                     _kernelJfaPass = shader.FindKernel("JFA_Pass");
                     _kernelFinalizeSdf = shader.FindKernel("FinalizeSDF");
                 }
-
                 // 2. Create and set buffers
                 int triangleCount = mesh.indices.Count / 3;
                 _vertexBuffer = new ComputeBuffer(mesh.vertexCount, sizeof(float) * 3);
                 _vertexBuffer.SetData(mesh.vertices);
                 _indexBuffer = new ComputeBuffer(mesh.indices.Count, sizeof(int));
                 _indexBuffer.SetData(mesh.indices);
-
                 int voxelCount = mesh.voxelDimensions.x * mesh.voxelDimensions.y * mesh.voxelDimensions.z;
                 _voxelBuffer = new ComputeBuffer(voxelCount, sizeof(float));
-
                 // Set common uniforms and buffers
                 shader.SetInt("g_TriangleCount", triangleCount);
                 shader.SetInts("g_VoxelDimensions", new int[] { mesh.voxelDimensions.x, mesh.voxelDimensions.y, mesh.voxelDimensions.z });
@@ -4898,33 +5115,26 @@ namespace Empart.EmberPart
                 shader.SetVector("g_VoxelBoundsSize", mesh.voxelBounds.size);
                 shader.SetBuffer(_kernelVoxelize, "g_Vertices", _vertexBuffer);
                 shader.SetBuffer(_kernelVoxelize, "g_Indices", _indexBuffer);
-
                 // 3. Dispatch Clear Kernel
                 shader.SetBuffer(_kernelClear, "g_Voxels", _voxelBuffer);
                 Dispatch(shader, _kernelClear, voxelCount);
-
                 // 4. Dispatch Voxelize Kernel to create surface voxelization
                 shader.SetBuffer(_kernelVoxelize, "g_Voxels", _voxelBuffer);
                 Dispatch(shader, _kernelVoxelize, triangleCount);
-
                 // 5. Dispatch Solidify Kernel (using a parallel scanline flood fill)
                 shader.SetBuffer(_kernelSolidify, "g_Voxels", _voxelBuffer);
                 Dispatch(shader, _kernelSolidify, mesh.voxelDimensions.x * mesh.voxelDimensions.y);
-
                 // 6. If SDF is enabled, run the full JFA pipeline
                 if (generateSdf)
                 {
                     _jfaGridBuffer = new ComputeBuffer(voxelCount, sizeof(int) * 3);
-
                     // 6a. Seed the JFA grid from the surface voxels
                     shader.SetBuffer(_kernelJfaSeed, "g_Voxels", _voxelBuffer);
                     shader.SetBuffer(_kernelJfaSeed, "g_JFAGrid", _jfaGridBuffer);
                     Dispatch(shader, _kernelJfaSeed, voxelCount);
-
                     // 6b. Run JFA passes with decreasing step sizes
                     int maxDim = Mathf.Max(mesh.voxelDimensions.x, Mathf.Max(mesh.voxelDimensions.y, mesh.voxelDimensions.z));
                     int step = (int)Mathf.Pow(2, Mathf.Floor(Mathf.Log2(maxDim)));
-
                     shader.SetBuffer(_kernelJfaPass, "g_JFAGrid", _jfaGridBuffer);
                     while (step >= 1)
                     {
@@ -4932,23 +5142,18 @@ namespace Empart.EmberPart
                         Dispatch(shader, _kernelJfaPass, voxelCount);
                         step /= 2;
                     }
-
                     // 6c. Finalize the SDF calculation
                     shader.SetBuffer(_kernelFinalizeSdf, "g_Voxels", _voxelBuffer);
                     shader.SetBuffer(_kernelFinalizeSdf, "g_JFAGrid", _jfaGridBuffer);
                     Dispatch(shader, _kernelFinalizeSdf, voxelCount);
-
                     _jfaGridBuffer.Release();
                 }
-
                 // 7. Read back data and release buffers
                 _voxelBuffer.GetData(mesh.sdfValues);
-
                 _vertexBuffer.Release();
                 _indexBuffer.Release();
                 _voxelBuffer.Release();
             }
-
             private static void Dispatch(ComputeShader shader, int kernel, int count)
             {
                 shader.GetKernelThreadGroupSizes(kernel, out uint x, out uint y, out uint z);
