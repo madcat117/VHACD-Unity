@@ -74,11 +74,6 @@ public class EmpartDecomposerEditor : Editor
         }
         GUI.enabled = true; // Re-enable GUI for other controls
 
-        if (GUILayout.Button("Run Smoke Test"))
-        {
-            decomposer.RunSmokeTest();
-        }
-
         if (!settingsAssigned)
         {
             EditorGUILayout.HelpBox("Assign settings to enable generation.", MessageType.Warning);
