@@ -1,10 +1,13 @@
 #pragma kernel Clear
 #pragma kernel VoxelizeSurface
 #pragma kernel Solidify
+#pragma kernel JFA_Seed
+#pragma kernel JFA_Pass
 #pragma kernel FinalizeSDF
 
 // Buffers
-RWStructuredBuffer<float> g_Voxels;
+RWStructuredBuffer<float> g_Voxels; // Will store the final SDF
+RWStructuredBuffer<int3> g_JFAGrid; // Stores the xyz coordinate of the closest seed
 StructuredBuffer<float3> g_Vertices;
 StructuredBuffer<int3> g_Indices;
 
@@ -13,35 +16,12 @@ int g_TriangleCount;
 int3 g_VoxelDimensions;
 float3 g_VoxelBoundsMin;
 float3 g_VoxelBoundsSize;
-
-[numthreads(8,8,8)]
-void Clear (uint3 id : SV_DispatchThreadID)
-{
-    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-    if (index < g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z)
-    {
-        g_Voxels[index] = 1.0; // Initialize all voxels to "outside"
-    }
-}
+int g_JfaStep;
 
 // ==================================================================================
 // Separating Axis Theorem (SAT) for Triangle-AABB Intersection
 // ==================================================================================
-void project(float3 axis, float3 p0, float3 p1, float3 p2, out float min_val, out float max_val)
-{
-    min_val = dot(axis, p0);
-    max_val = min_val;
-
-    float d = dot(axis, p1);
-    min_val = min(min_val, d);
-    max_val = max(max_val, d);
-
-    d = dot(axis, p2);
-    min_val = min(min_val, d);
-    max_val = max(max_val, d);
-}
-
-bool test_axis(float3 axis, float3 v0, float3 v1, float3 v2, float3 box_center, float3 box_half_size)
+bool test_axis(float3 axis, float3 v0, float3 v1, float3 v2, float3 box_half_size)
 {
     float p0 = dot(axis, v0);
     float p1 = dot(axis, v1);
@@ -52,46 +32,49 @@ bool test_axis(float3 axis, float3 v0, float3 v1, float3 v2, float3 box_center, 
     float min_p = min(p0, min(p1, p2));
     float max_p = max(p0, max(p1, p2));
 
-    float box_center_proj = dot(axis, box_center);
-
-    return (max(box_center_proj + r, max_p) - min(box_center_proj - r, min_p)) <= (r * 2 + max_p - min_p);
+    return max_p >= -r && min_p <= r;
 }
 
 bool TriangleAABBOverlap(float3 v0, float3 v1, float3 v2, float3 box_center, float3 box_half_size)
 {
-    // Translate triangle so box is at origin
     v0 -= box_center;
     v1 -= box_center;
     v2 -= box_center;
 
-    // Triangle edges
     float3 f0 = v1 - v0;
     float3 f1 = v2 - v1;
     float3 f2 = v0 - v2;
 
-    // 1. AABB face normals (3 axes)
-    if (!test_axis(float3(1, 0, 0), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(float3(0, 1, 0), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(float3(0, 0, 1), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
+    if (!test_axis(float3(1, 0, 0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(float3(0, 1, 0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(float3(0, 0, 1), v0, v1, v2, box_half_size)) return false;
 
-    // 2. Triangle normal (1 axis)
     float3 tri_normal = cross(f0, f1);
-    if (!test_axis(tri_normal, v0, v1, v2, float3(0,0,0), box_half_size)) return false;
+    if (!test_axis(tri_normal, v0, v1, v2, box_half_size)) return false;
 
-    // 3. Cross products of triangle edges and box axes (9 axes)
-    if (!test_axis(cross(float3(1, 0, 0), f0), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(1, 0, 0), f1), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(1, 0, 0), f2), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 1, 0), f0), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 1, 0), f1), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 1, 0), f2), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 0, 1), f0), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 0, 1), f1), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 0, 1), f2), v0, v1, v2, float3(0,0,0), box_half_size)) return false;
+    if (!test_axis(cross(float3(1, 0, 0), f0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(1, 0, 0), f1), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(1, 0, 0), f2), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 1, 0), f0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 1, 0), f1), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 1, 0), f2), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 0, 1), f0), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 0, 1), f1), v0, v1, v2, box_half_size)) return false;
+    if (!test_axis(cross(float3(0, 0, 1), f2), v0, v1, v2, box_half_size)) return false;
 
-    return true; // No separating axis found, they must overlap
+    return true;
 }
 // ==================================================================================
+
+[numthreads(8,8,8)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index < g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z)
+    {
+        g_Voxels[index] = 1.0;
+    }
+}
 
 [numthreads(64,1,1)]
 void VoxelizeSurface (uint3 id : SV_DispatchThreadID)
@@ -103,17 +86,14 @@ void VoxelizeSurface (uint3 id : SV_DispatchThreadID)
     float3 v1 = g_Vertices[tri.y];
     float3 v2 = g_Vertices[tri.z];
 
-    // Calculate triangle bounding box
     float3 minP = min(v0, min(v1, v2));
     float3 maxP = max(v0, max(v1, v2));
 
     float3 voxel_size = g_VoxelBoundsSize / g_VoxelDimensions;
 
-    // Convert to voxel coordinates, clamping to grid bounds
     int3 minCoord = max(int3(0,0,0), (int3)floor((minP - g_VoxelBoundsMin) / voxel_size));
     int3 maxCoord = min(g_VoxelDimensions - 1, (int3)ceil((maxP - g_VoxelBoundsMin) / voxel_size));
 
-    // Iterate over voxels in the triangle's AABB
     for (int z = minCoord.z; z <= maxCoord.z; z++)
     {
         for (int y = minCoord.y; y <= maxCoord.y; y++)
@@ -126,7 +106,7 @@ void VoxelizeSurface (uint3 id : SV_DispatchThreadID)
                 if (TriangleAABBOverlap(v0, v1, v2, voxelCenter, voxelHalfSize))
                 {
                     uint index = x + y * g_VoxelDimensions.x + z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-                    g_Voxels[index] = -1.0; // Mark as "inside" / on surface
+                    g_Voxels[index] = -1.0;
                 }
             }
         }
@@ -136,47 +116,104 @@ void VoxelizeSurface (uint3 id : SV_DispatchThreadID)
 [numthreads(8,8,1)]
 void Solidify (uint3 id : SV_DispatchThreadID)
 {
-    // Parallel scanline flood fill along Z-axis
     uint x = id.x;
     uint y = id.y;
-
     if (x >= g_VoxelDimensions.x || y >= g_VoxelDimensions.y) return;
 
     bool inside = false;
     for (uint z = 0; z < g_VoxelDimensions.z; z++)
     {
         uint index = x + y * g_VoxelDimensions.x + z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-
-        // Check if the current voxel is a surface voxel
         if (g_Voxels[index] < 0)
         {
             inside = !inside;
         }
-
         if (inside)
         {
-            // Mark the voxel as inside, even if it wasn't a surface voxel
              g_Voxels[index] = -1.0;
         }
     }
 }
 
 [numthreads(8,8,8)]
+void JFA_Seed(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
+
+    if (g_Voxels[index] < 0) {
+        g_JFAGrid[index] = id.xyz; // This is a surface voxel, so it is its own seed.
+    } else {
+        g_JFAGrid[index] = int3(-1, -1, -1); // Mark as unseeded.
+    }
+}
+
+[numthreads(8,8,8)]
+void JFA_Pass(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
+
+    int3 p = id.xyz;
+    int3 best_seed = g_JFAGrid[index];
+    float min_dist_sq = 1e20;
+
+    if (best_seed.x != -1)
+    {
+        min_dist_sq = dot(p - best_seed, p - best_seed);
+    }
+
+    // Sample neighbors in a 3x3x3 grid at the current step size
+    for (int z = -1; z <= 1; ++z)
+    {
+        for (int y = -1; y <= 1; ++y)
+        {
+            for (int x = -1; x <= 1; ++x)
+            {
+                int3 neighbor_p = p + int3(x, y, z) * g_JfaStep;
+
+                if (all(neighbor_p >= 0) && all(neighbor_p < g_VoxelDimensions))
+                {
+                    uint neighbor_idx = neighbor_p.x + neighbor_p.y * g_VoxelDimensions.x + neighbor_p.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
+                    int3 neighbor_seed = g_JFAGrid[neighbor_idx];
+
+                    if (neighbor_seed.x != -1)
+                    {
+                        float dist_sq = dot(p - neighbor_seed, p - neighbor_seed);
+                        if (dist_sq < min_dist_sq)
+                        {
+                            min_dist_sq = dist_sq;
+                            best_seed = neighbor_seed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    g_JFAGrid[index] = best_seed;
+}
+
+[numthreads(8,8,8)]
 void FinalizeSDF (uint3 id : SV_DispatchThreadID)
 {
-    // This is a placeholder for a proper GPU-based Jump Flooding Algorithm (JFA).
-    // A full JFA is complex and would involve multiple passes.
-    // For now, this kernel just ensures the values are either -1 (inside) or 1 (outside).
     uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-    if (index < g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z)
+    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
+
+    int3 seed = g_JFAGrid[index];
+    if (seed.x != -1)
     {
-       if(g_Voxels[index] < 0)
-       {
-           g_Voxels[index] = -0.5; // Represents inside, close to surface
-       }
-       else
-       {
-           g_Voxels[index] = 0.5; // Represents outside, close to surface
-       }
+        float3 voxel_size = g_VoxelBoundsSize / g_VoxelDimensions;
+        float3 p_world = g_VoxelBoundsMin + (id.xyz + 0.5) * voxel_size;
+        float3 seed_world = g_VoxelBoundsMin + (seed + 0.5) * voxel_size;
+
+        float dist = length(p_world - seed_world);
+
+        // Apply sign based on the solidification pass result (stored in g_Voxels)
+        g_Voxels[index] = (g_Voxels[index] < 0) ? -dist : dist;
+    }
+    else
+    {
+        // Should not happen if JFA is complete, but as a fallback, mark as far away.
+        g_Voxels[index] = g_VoxelBoundsSize.x;
     }
 }

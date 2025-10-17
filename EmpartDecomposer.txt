@@ -1176,8 +1176,16 @@ namespace Empart.EmberPart
                         break;
 
                     case ConvexDecompositionSettings.SaliencyMethod.Geodesic:
-                         // Placeholder for a more complex geodesic saliency metric
-                         // For now, we'll fall back to curvature.
+                        // The Heat Method provides a good approximation of geodesic distance,
+                        // so we use it here for a geodesic-based saliency metric.
+                        var geodesicHeat = Geodesic.CalculateHeat(this, heatIterations);
+                        float maxGeodesicHeat = 0;
+                        for(int i=0; i<geodesicHeat.Count; i++) maxGeodesicHeat = Mathf.Max(maxGeodesicHeat, geodesicHeat[i]);
+                        if(maxGeodesicHeat > 0)
+                        {
+                            for(int i=0; i<geodesicHeat.Count; i++) vertexSaliency[i] = geodesicHeat[i] / maxGeodesicHeat;
+                        }
+                        break;
                     case ConvexDecompositionSettings.SaliencyMethod.Curvature:
                     default:
                         if (curvature == null || curvature.Count != vertices.Count) CalculateCurvature();
@@ -1583,7 +1591,7 @@ namespace Empart.EmberPart
 
                 if (settings.voxelMethod == ConvexDecompositionSettings.VoxelizationMethod.GPU_Accelerated)
                 {
-                    GpuVoxelizer.Voxelize(this, settings.voxelizationShader);
+                    GpuVoxelizer.Voxelize(this, settings.voxelizationShader, settings.enableSDF);
                 }
                 else
                 {
@@ -1737,47 +1745,44 @@ namespace Empart.EmberPart
             /// <summary>
             /// Compute SDF from voxel grid
             /// </summary>
-            public void ComputeSDF(ConvexDecompositionSettings.SDFGenerationMethod method, int iterations = 5, float smoothing = 0.1f)
+            public void ComputeSDF(ConvexDecompositionSettings settings)
             {
-                if (!enableSDF || sdfValues.Length == 0) return;
+                if (!settings.enableSDF || !sdfValues.IsCreated || sdfValues.Length == 0) return;
 
-                switch (method)
+                // The actual SDF generation is now part of the GpuVoxelizer pipeline if using GPU.
+                // If using CPU, we use the basic smoothing method.
+                if (settings.voxelMethod != ConvexDecompositionSettings.VoxelizationMethod.GPU_Accelerated)
                 {
-                    case ConvexDecompositionSettings.SDFGenerationMethod.JumpFlooding:
-                        JumpFlooding.GenerateSDF(this);
-                        break;
-                    case ConvexDecompositionSettings.SDFGenerationMethod.Basic:
-                    default:
-                        // Use fast marching method or iterative smoothing for SDF
-                        for (int iter = 0; iter < iterations; iter++)
+                     // Use fast marching method or iterative smoothing for SDF
+                    for (int iter = 0; iter < 5; iter++) // Hardcoded iterations for basic method
+                    {
+                        var newSDF = new NativeArray<float>(sdfValues, Allocator.Temp);
+                        for (int x = 1; x < voxelDimensions.x - 1; x++)
                         {
-                            var newSDF = new NativeArray<float>(sdfValues, Allocator.Temp);
-                            for (int x = 1; x < voxelDimensions.x - 1; x++)
+                            for (int y = 1; y < voxelDimensions.y - 1; y++)
                             {
-                                for (int y = 1; y < voxelDimensions.y - 1; y++)
+                                for (int z = 1; z < voxelDimensions.z - 1; z++)
                                 {
-                                    for (int z = 1; z < voxelDimensions.z - 1; z++)
+                                    int idx = GetVoxelIndex(new int3(x, y, z));
+                                    float sum = 0f;
+                                    int count = 0;
+                                    // Neighbor offsets
+                                    int3[] offsets = { new int3(1, 0, 0), new int3(-1, 0, 0), new int3(0, 1, 0), new int3(0, -1, 0), new int3(0, 0, 1), new int3(0, 0, -1) };
+                                    foreach (var off in offsets)
                                     {
-                                        int idx = GetVoxelIndex(new int3(x, y, z));
-                                        float sum = 0f;
-                                        int count = 0;
-                                        // Neighbor offsets
-                                        int3[] offsets = { new int3(1, 0, 0), new int3(-1, 0, 0), new int3(0, 1, 0), new int3(0, -1, 0), new int3(0, 0, 1), new int3(0, 0, -1) };
-                                        foreach (var off in offsets)
-                                        {
-                                            int nIdx = GetVoxelIndex(new int3(x, y, z) + off);
-                                            sum += sdfValues[nIdx];
-                                            count++;
-                                        }
-                                        newSDF[idx] = sdfValues[idx] * (1 - smoothing) + (sum / count) * smoothing;
+                                        int nIdx = GetVoxelIndex(new int3(x, y, z) + off);
+                                        sum += sdfValues[nIdx];
+                                        count++;
                                     }
+                                    newSDF[idx] = sdfValues[idx] * (1 - 0.1f) + (sum / count) * 0.1f;
                                 }
                             }
-                            sdfValues.CopyFrom(newSDF);
-                            newSDF.Dispose();
                         }
-                        break;
+                        sdfValues.CopyFrom(newSDF);
+                        newSDF.Dispose();
+                    }
                 }
+                // For GPU method, SDF is computed in GpuVoxelizer.Voxelize
             }
             /// <summary>
             /// Decimate mesh to reduce vertex count
@@ -4390,34 +4395,27 @@ namespace Empart.EmberPart
             }
             public static MeshData BooleanDifference(MeshData mesh, Bounds box)
             {
-                var boxPlanes = new List<PlaneF>
+                var planes = new List<PlaneF>
                 {
-                    // Note: The planes are inverted to clip what's INSIDE the box, leaving the outside.
-                    new PlaneF { n = Vector3.right, d = box.min.x },
-                    new PlaneF { n = Vector3.left, d = -box.max.x },
-                    new PlaneF { n = Vector3.up, d = box.min.y },
-                    new PlaneF { n = Vector3.down, d = -box.max.y },
-                    new PlaneF { n = Vector3.forward, d = box.min.z },
-                    new PlaneF { n = Vector3.back, d = -box.max.z },
+                    new PlaneF { n = new Vector3(1, 0, 0), d = -box.max.x },
+                    new PlaneF { n = new Vector3(-1, 0, 0), d = box.min.x },
+                    new PlaneF { n = new Vector3(0, 1, 0), d = -box.max.y },
+                    new PlaneF { n = new Vector3(0, -1, 0), d = box.min.y },
+                    new PlaneF { n = new Vector3(0, 0, 1), d = -box.max.z },
+                    new PlaneF { n = new Vector3(0, 0, -1), d = box.min.z }
                 };
 
-                var tempMesh = mesh;
-                // We clip the mesh against the *inverted* planes of the box.
-                // This means we are keeping the part of the mesh that is on the "negative" side of each inverted plane,
-                // which corresponds to the region outside the original box face.
-                foreach(var plane in boxPlanes)
+                var outsideMesh = mesh;
+                var insideMesh = new MeshData();
+
+                foreach (var plane in planes)
                 {
-                    var clippedOut = new MeshData();
-                    var invertedPlane = new PlaneF { n = -plane.n, d = -plane.d};
-                    // We only care about the negative (outside) part
-                    MeshSplitter.Split(tempMesh, invertedPlane, out _, out clippedOut);
-                    tempMesh = clippedOut;
+                    // Split the mesh by the plane, keeping the "outside" part
+                    MeshSplitter.Split(outsideMesh, new PlaneF {n = -plane.n, d = -plane.d}, out var _, out outsideMesh);
                 }
-                // The simple center-check version was a regression and has been removed.
-                // A full mesh-mesh boolean operation is significantly more complex and would require a full CSG library.
-                // This bounds-based clipping is what's required by the decomposition algorithm.
-                tempMesh.CalculateProperties();
-                return tempMesh;
+
+                outsideMesh.CalculateProperties();
+                return outsideMesh;
             }
             public static MeshData BooleanDifference(MeshData meshA, MeshData meshB)
             {
@@ -4854,61 +4852,94 @@ namespace Empart.EmberPart
 
         public static class GpuVoxelizer
         {
+            // Kernels
             private static int _kernelClear;
             private static int _kernelVoxelize;
             private static int _kernelSolidify;
+            private static int _kernelJfaSeed;
+            private static int _kernelJfaPass;
             private static int _kernelFinalizeSdf;
 
+            // Buffers
             private static ComputeBuffer _vertexBuffer;
             private static ComputeBuffer _indexBuffer;
-            private static ComputeBuffer _voxelBuffer;
+            private static ComputeBuffer _voxelBuffer; // Stores solid voxelization (temp) and final SDF
+            private static ComputeBuffer _jfaGridBuffer; // Stores seed coordinates
 
-            public static void Voxelize(MeshData mesh, ComputeShader shader)
+            public static void Voxelize(MeshData mesh, ComputeShader shader, bool generateSdf)
             {
-                if (shader == null)
-                {
-                    Debug.LogError("Voxelization Compute Shader is not assigned.");
-                    return;
-                }
+                if (shader == null) { Debug.LogError("Voxelization Compute Shader is not assigned."); return; }
 
-                // 1. Find kernels
+                // 1. Find all necessary kernels
                 _kernelClear = shader.FindKernel("Clear");
                 _kernelVoxelize = shader.FindKernel("VoxelizeSurface");
                 _kernelSolidify = shader.FindKernel("Solidify");
-                _kernelFinalizeSdf = shader.FindKernel("FinalizeSDF");
+                if (generateSdf)
+                {
+                    _kernelJfaSeed = shader.FindKernel("JFA_Seed");
+                    _kernelJfaPass = shader.FindKernel("JFA_Pass");
+                    _kernelFinalizeSdf = shader.FindKernel("FinalizeSDF");
+                }
 
                 // 2. Create and set buffers
                 int triangleCount = mesh.indices.Count / 3;
                 _vertexBuffer = new ComputeBuffer(mesh.vertexCount, sizeof(float) * 3);
                 _vertexBuffer.SetData(mesh.vertices);
-                _indexBuffer = new ComputeBuffer(triangleCount, sizeof(int) * 3);
+                _indexBuffer = new ComputeBuffer(mesh.indices.Count, sizeof(int));
                 _indexBuffer.SetData(mesh.indices);
 
                 int voxelCount = mesh.voxelDimensions.x * mesh.voxelDimensions.y * mesh.voxelDimensions.z;
                 _voxelBuffer = new ComputeBuffer(voxelCount, sizeof(float));
 
-                shader.SetBuffer(_kernelVoxelize, "g_Vertices", _vertexBuffer);
-                shader.SetBuffer(_kernelVoxelize, "g_Indices", _indexBuffer);
-                shader.SetBuffer(_kernelVoxelize, "g_Voxels", _voxelBuffer);
+                // Set common uniforms and buffers
                 shader.SetInt("g_TriangleCount", triangleCount);
-                shader.SetInts("g_VoxelDimensions", new int[]{mesh.voxelDimensions.x, mesh.voxelDimensions.y, mesh.voxelDimensions.z});
+                shader.SetInts("g_VoxelDimensions", new int[] { mesh.voxelDimensions.x, mesh.voxelDimensions.y, mesh.voxelDimensions.z });
                 shader.SetVector("g_VoxelBoundsMin", mesh.voxelBounds.min);
                 shader.SetVector("g_VoxelBoundsSize", mesh.voxelBounds.size);
+                shader.SetBuffer(_kernelVoxelize, "g_Vertices", _vertexBuffer);
+                shader.SetBuffer(_kernelVoxelize, "g_Indices", _indexBuffer);
 
                 // 3. Dispatch Clear Kernel
                 shader.SetBuffer(_kernelClear, "g_Voxels", _voxelBuffer);
                 Dispatch(shader, _kernelClear, voxelCount);
 
-                // 4. Dispatch Voxelize Kernel
+                // 4. Dispatch Voxelize Kernel to create surface voxelization
+                shader.SetBuffer(_kernelVoxelize, "g_Voxels", _voxelBuffer);
                 Dispatch(shader, _kernelVoxelize, triangleCount);
 
                 // 5. Dispatch Solidify Kernel (using a parallel scanline flood fill)
                 shader.SetBuffer(_kernelSolidify, "g_Voxels", _voxelBuffer);
                 Dispatch(shader, _kernelSolidify, mesh.voxelDimensions.x * mesh.voxelDimensions.y);
 
-                // 6. Dispatch Finalize SDF Kernel (placeholder for JFA on GPU)
-                shader.SetBuffer(_kernelFinalizeSdf, "g_Voxels", _voxelBuffer);
-                Dispatch(shader, _kernelFinalizeSdf, voxelCount);
+                // 6. If SDF is enabled, run the full JFA pipeline
+                if (generateSdf)
+                {
+                    _jfaGridBuffer = new ComputeBuffer(voxelCount, sizeof(int) * 3);
+
+                    // 6a. Seed the JFA grid from the surface voxels
+                    shader.SetBuffer(_kernelJfaSeed, "g_Voxels", _voxelBuffer);
+                    shader.SetBuffer(_kernelJfaSeed, "g_JFAGrid", _jfaGridBuffer);
+                    Dispatch(shader, _kernelJfaSeed, voxelCount);
+
+                    // 6b. Run JFA passes with decreasing step sizes
+                    int maxDim = Mathf.Max(mesh.voxelDimensions.x, Mathf.Max(mesh.voxelDimensions.y, mesh.voxelDimensions.z));
+                    int step = (int)Mathf.Pow(2, Mathf.Floor(Mathf.Log2(maxDim)));
+
+                    shader.SetBuffer(_kernelJfaPass, "g_JFAGrid", _jfaGridBuffer);
+                    while (step >= 1)
+                    {
+                        shader.SetInt("g_JfaStep", step);
+                        Dispatch(shader, _kernelJfaPass, voxelCount);
+                        step /= 2;
+                    }
+
+                    // 6c. Finalize the SDF calculation
+                    shader.SetBuffer(_kernelFinalizeSdf, "g_Voxels", _voxelBuffer);
+                    shader.SetBuffer(_kernelFinalizeSdf, "g_JFAGrid", _jfaGridBuffer);
+                    Dispatch(shader, _kernelFinalizeSdf, voxelCount);
+
+                    _jfaGridBuffer.Release();
+                }
 
                 // 7. Read back data and release buffers
                 _voxelBuffer.GetData(mesh.sdfValues);
@@ -4922,7 +4953,9 @@ namespace Empart.EmberPart
             {
                 shader.GetKernelThreadGroupSizes(kernel, out uint x, out uint y, out uint z);
                 int threadGroupX = Mathf.CeilToInt(count / (float)x);
-                shader.Dispatch(kernel, threadGroupX, 1, 1);
+                int threadGroupY = Mathf.CeilToInt(1 / (float)y);
+                int threadGroupZ = Mathf.CeilToInt(1 / (float)z);
+                shader.Dispatch(kernel, threadGroupX, threadGroupY, threadGroupZ);
             }
         }
         /// <summary>
@@ -5134,15 +5167,75 @@ namespace Empart.EmberPart
                 mesh.CalculateProperties();
             }
 
+            private static bool Invert(Quadric q, out Vector3 p)
+            {
+                // This computes the inverse of the top-left 3x3 sub-matrix of the Quadric
+                // and solves for the optimal position. It uses double precision for stability.
+                double det = q.m11 * (q.m22 * q.m33 - q.m23 * q.m23) -
+                             q.m12 * (q.m12 * q.m33 - q.m13 * q.m23) +
+                             q.m13 * (q.m12 * q.m23 - q.m22 * q.m13);
+
+                if (System.Math.Abs(det) < 1e-15)
+                {
+                    p = Vector3.zero;
+                    return false;
+                }
+
+                double invDet = 1.0 / det;
+
+                // Calculate the inverse of the 3x3 matrix and multiply by the vector part of the quadric (-b)
+                p.x = (float)(invDet * (
+                    (q.m22 * q.m33 - q.m23 * q.m23) * (-q.m14) +
+                    -(q.m12 * q.m33 - q.m13 * q.m23) * (-q.m24) +
+                     (q.m12 * q.m23 - q.m22 * q.m13) * (-q.m34)
+                ));
+                p.y = (float)(invDet * (
+                    -(q.m12 * q.m33 - q.m23 * q.m13) * (-q.m14) +
+                     (q.m11 * q.m33 - q.m13 * q.m13) * (-q.m24) +
+                    -(q.m11 * q.m23 - q.m12 * q.m13) * (-q.m34)
+                ));
+                p.z = (float)(invDet * (
+                     (q.m12 * q.m23 - q.m13 * q.m22) * (-q.m14) +
+                    -(q.m11 * q.m23 - q.m13 * q.m12) * (-q.m24) +
+                     (q.m11 * q.m22 - q.m12 * q.m12) * (-q.m34)
+                ));
+
+                return true;
+            }
+
             private static Vector3 CalculateOptimalPosition(Vertex v1, Vertex v2, out float cost)
             {
                 var q = v1.q;
                 q.Add(v2.q);
 
-                // For simplicity, we'll just use the midpoint. A full matrix inversion is complex.
-                var p = (v1.p + v2.p) / 2.0f;
-                cost = q.Evaluate(p.x, p.y, p.z);
-                return p;
+                // Attempt to find the optimal position by inverting the quadric matrix
+                if (Invert(q, out Vector3 p))
+                {
+                    cost = q.Evaluate(p.x, p.y, p.z);
+                    return p;
+                }
+                else
+                {
+                    // If matrix is singular, fallback to a simpler (but robust) method.
+                    // Choose the best position among the two original vertices and their midpoint.
+                    Vector3 p1 = v1.p;
+                    Vector3 p2 = v2.p;
+                    Vector3 p_mid = (p1 + p2) / 2.0f;
+                    float cost1 = q.Evaluate(p1.x, p1.y, p1.z);
+                    float cost2 = q.Evaluate(p2.x, p2.y, p2.z);
+                    float cost_mid = q.Evaluate(p_mid.x, p_mid.y, p_mid.z);
+
+                    if (cost1 < cost2 && cost1 < cost_mid) {
+                        cost = cost1;
+                        return p1;
+                    } else if (cost2 < cost_mid) {
+                        cost = cost2;
+                        return p2;
+                    } else {
+                        cost = cost_mid;
+                        return p_mid;
+                    }
+                }
             }
         }
         public static class DecompositionCache
@@ -5285,245 +5378,6 @@ namespace Empart.EmberPart
         /// <summary>
         /// Split plane evaluator for finding optimal split planes
         /// </summary>
-        public static class JumpFlooding
-        {
-            [BurstCompile]
-            private struct SeedJob : IJobParallelFor
-            {
-                [ReadOnly] public NativeArray<Vector3> Vertices;
-                [ReadOnly] public NativeArray<int> Indices;
-                public NativeArray<int3> SeedLocations; // Stores the xyz of the closest seed
-                public int3 Dimensions;
-                public Bounds VoxelBounds;
-                public float3 VoxelSize;
-
-                public void Execute(int index)
-                {
-                    // Initialize with a marker for empty voxels
-                    SeedLocations[index] = new int3(-1, -1, -1);
-                }
-            }
-
-            [BurstCompile]
-            private struct JumpPassJob : IJobParallelFor
-            {
-                [ReadOnly] public NativeArray<int3> ReadSeedLocations;
-                public NativeArray<int3> WriteSeedLocations;
-                public int3 Dimensions;
-                public int Step;
-
-                public void Execute(int index)
-                {
-                    int3 p = new int3(index % Dimensions.x, (index / Dimensions.x) % Dimensions.y, index / (Dimensions.x * Dimensions.y));
-                    int3 bestSeed = ReadSeedLocations[index];
-                    float minDistSq = float.MaxValue;
-
-                    if(bestSeed.x != -1)
-                    {
-                        minDistSq = math.lengthsq(p - bestSeed);
-                    }
-
-                    for (int z = -1; z <= 1; z++)
-                    for (int y = -1; y <= 1; y++)
-                    for (int x = -1; x <= 1; x++)
-                    {
-                        if (x == 0 && y == 0 && z == 0) continue;
-
-                        int3 neighborP = p + new int3(x * Step, y * Step, z * Step);
-                        if (neighborP.x < 0 || neighborP.x >= Dimensions.x ||
-                            neighborP.y < 0 || neighborP.y >= Dimensions.y ||
-                            neighborP.z < 0 || neighborP.z >= Dimensions.z) continue;
-
-                        int neighborIdx = neighborP.x + Dimensions.x * (neighborP.y + Dimensions.y * neighborP.z);
-                        int3 neighborSeed = ReadSeedLocations[neighborIdx];
-
-                        if (neighborSeed.x != -1)
-                        {
-                            float distSq = math.lengthsq(p - neighborSeed);
-                            if (distSq < minDistSq)
-                            {
-                                minDistSq = distSq;
-                                bestSeed = neighborSeed;
-                            }
-                        }
-                    }
-                    WriteSeedLocations[index] = bestSeed;
-                }
-            }
-
-            [BurstCompile]
-            private struct FinalSDFJob : IJobParallelFor
-            {
-                [ReadOnly] public NativeArray<int3> SeedLocations;
-                public NativeArray<float> SDF;
-                public int3 Dimensions;
-                public float3 VoxelSize;
-
-                public void Execute(int index)
-                {
-                    int3 p = new int3(index % Dimensions.x, (index / Dimensions.x) % Dimensions.y, index / (Dimensions.x * Dimensions.y));
-                    int3 seed = SeedLocations[index];
-                    if (seed.x == -1)
-                    {
-                        SDF[index] = float.MaxValue;
-                    }
-                    else
-                    {
-                        float3 p_world = p * VoxelSize;
-                        float3 seed_world = seed * VoxelSize;
-                        SDF[index] = math.length(p_world - seed_world);
-                    }
-                }
-            }
-
-            [BurstCompile]
-            private struct SignPassJob : IJobParallelFor
-            {
-                [ReadOnly] public NativeArray<Vector3> Vertices;
-                [ReadOnly] public NativeArray<int> Indices;
-                public NativeArray<float> SDF;
-                public int3 Dimensions;
-                public Bounds VoxelBounds;
-                public float3 VoxelSize;
-
-                public void Execute(int index)
-                {
-                    float3 voxelCenter = VoxelBounds.min + new float3(index % Dimensions.x, (index / Dimensions.x) % Dimensions.y, index / (Dimensions.x * Dimensions.y)) * VoxelSize;
-
-                    int crossings = 0;
-                    float3 rayDir = new float3(1, 0.1f, 0.05f); // Jittered ray to avoid hitting edges/verts
-
-                    for(int i=0; i < Indices.Length; i+=3)
-                    {
-                        float3 v0 = Vertices[Indices[i]];
-                        float3 v1 = Vertices[Indices[i+1]];
-                        float3 v2 = Vertices[Indices[i+2]];
-
-                        if(RayTriangleIntersect(voxelCenter, rayDir, v0, v1, v2))
-                        {
-                            crossings++;
-                        }
-                    }
-
-                    if(crossings % 2 == 1) // Odd number of crossings means we are inside
-                    {
-                        SDF[index] *= -1.0f;
-                    }
-                }
-
-                // Moller-Trumbore intersection algorithm
-                private bool RayTriangleIntersect(float3 ro, float3 rd, float3 v0, float3 v1, float3 v2)
-                {
-                    float3 edge1 = v1 - v0;
-                    float3 edge2 = v2 - v0;
-                    float3 h = math.cross(rd, edge2);
-                    float a = math.dot(edge1, h);
-                    if (a > -1e-6 && a < 1e-6) return false; // Parallel
-
-                    float f = 1.0f / a;
-                    float3 s = ro - v0;
-                    float u = f * math.dot(s, h);
-                    if (u < 0.0 || u > 1.0) return false;
-
-                    float3 q = math.cross(s, edge1);
-                    float v = f * math.dot(rd, q);
-                    if (v < 0.0 || u + v > 1.0) return false;
-
-                    float t = f * math.dot(edge2, q);
-                    return t > 1e-6; // Epsilon check
-                }
-            }
-
-            public static void GenerateSDF(MeshData mesh)
-            {
-                int voxelCount = mesh.voxelDimensions.x * mesh.voxelDimensions.y * mesh.voxelDimensions.z;
-                var seedLocations = new NativeArray<int3>(voxelCount, Allocator.TempJob);
-                var tempSeedLocations = new NativeArray<int3>(voxelCount, Allocator.TempJob);
-
-                var vertices = new NativeArray<Vector3>(mesh.vertices.ToArray(), Allocator.TempJob);
-                var indices = new NativeArray<int>(mesh.indices.ToArray(), Allocator.TempJob);
-
-                // 1. Seeding Pass
-                var seedJob = new SeedJob
-                {
-                    Vertices = vertices,
-                    Indices = indices,
-                    SeedLocations = seedLocations,
-                    Dimensions = mesh.voxelDimensions,
-                    VoxelBounds = mesh.voxelBounds,
-                    VoxelSize = mesh.voxelBounds.size / new float3(mesh.voxelDimensions)
-                };
-                seedJob.Schedule(voxelCount, 64).Complete();
-
-                // This part is slow. A better approach would be to rasterize the triangles.
-                for(int i=0; i<mesh.indices.Count; i+=3)
-                {
-                    var v0 = mesh.vertices[mesh.indices[i]];
-                    var v1 = mesh.vertices[mesh.indices[i+1]];
-                    var v2 = mesh.vertices[mesh.indices[i+2]];
-                    var c0 = mesh.WorldToVoxel(v0);
-                    var c1 = mesh.WorldToVoxel(v1);
-                    var c2 = mesh.WorldToVoxel(v2);
-                    // Simple rasterization - mark voxels containing vertices
-                     if(mesh.IsVoxelInBounds(c0)) seedLocations[c0.x + c0.y * mesh.voxelDimensions.x + c0.z * mesh.voxelDimensions.x * mesh.voxelDimensions.y] = c0;
-                     if(mesh.IsVoxelInBounds(c1)) seedLocations[c1.x + c1.y * mesh.voxelDimensions.x + c1.z * mesh.voxelDimensions.x * mesh.voxelDimensions.y] = c1;
-                     if(mesh.IsVoxelInBounds(c2)) seedLocations[c2.x + c2.y * mesh.voxelDimensions.x + c2.z * mesh.voxelDimensions.x * mesh.voxelDimensions.y] = c2;
-                }
-
-                // 2. Jump Flooding Passes
-                int maxDim = math.max(mesh.voxelDimensions.x, math.max(mesh.voxelDimensions.y, mesh.voxelDimensions.z));
-                int step = (int)math.pow(2, math.floor(math.log2(maxDim)));
-
-                var read = seedLocations;
-                var write = tempSeedLocations;
-
-                while(step >= 1)
-                {
-                    var jumpJob = new JumpPassJob
-                    {
-                        ReadSeedLocations = read,
-                        WriteSeedLocations = write,
-                        Dimensions = mesh.voxelDimensions,
-                        Step = step
-                    };
-                    jumpJob.Schedule(voxelCount, 64).Complete();
-
-                    // Swap buffers
-                    var tmp = read;
-                    read = write;
-                    write = tmp;
-
-                    step /= 2;
-                }
-
-                // 3. Final Distance Calculation
-                var finalSDFJob = new FinalSDFJob
-                {
-                    SeedLocations = read,
-                    SDF = mesh.sdfValues,
-                    Dimensions = mesh.voxelDimensions,
-                    VoxelSize = mesh.voxelBounds.size / new float3(mesh.voxelDimensions)
-                };
-                finalSDFJob.Schedule(voxelCount, 64).Complete();
-
-                // 4. Sign Pass
-                var signPassJob = new SignPassJob
-                {
-                    Vertices = vertices,
-                    Indices = indices,
-                    SDF = mesh.sdfValues,
-                    Dimensions = mesh.voxelDimensions,
-                    VoxelBounds = mesh.voxelBounds,
-                    VoxelSize = mesh.voxelBounds.size / new float3(mesh.voxelDimensions)
-                };
-                signPassJob.Schedule(voxelCount, 64).Complete();
-
-                seedLocations.Dispose();
-                tempSeedLocations.Dispose();
-                vertices.Dispose();
-                indices.Dispose();
-            }
-        }
         public static class SplitPlaneEvaluator
         {
             public static (Vector3 normal, Vector3 point) FindBestSplitPlane(MeshData mesh, ConvexHull hull, float concavity)
@@ -5595,9 +5449,58 @@ namespace Empart.EmberPart
             }
             private static (Vector3 normal, Vector3 point) GenerateVoxelBasedCandidate(MeshData mesh)
             {
-                // Use voxel data to find high concavity plane
-                // ... (add logic)
-                return (Vector3.up, mesh.bounds.center); // Placeholder
+                if (mesh.sdfValues == null || !mesh.sdfValues.IsCreated || mesh.sdfValues.Length == 0)
+                {
+                    return (Vector3.zero, Vector3.zero);
+                }
+
+                // Find the voxel with the maximum SDF value (deepest point in a concavity)
+                float maxSdf = float.MinValue;
+                int maxSdfIndex = -1;
+                for (int i = 0; i < mesh.sdfValues.Length; i++)
+                {
+                    if (mesh.sdfValues[i] > maxSdf)
+                    {
+                        maxSdf = mesh.sdfValues[i];
+                        maxSdfIndex = i;
+                    }
+                }
+
+                if (maxSdfIndex == -1 || maxSdf < 0.001f) // No significant concavity found
+                {
+                    return (Vector3.zero, Vector3.zero);
+                }
+
+                int3 coord = mesh.GetVoxelCoord(maxSdfIndex);
+                Vector3 point = mesh.VoxelToWorld(coord);
+
+                // Calculate the SDF gradient at this point to get the normal
+                int3 xp = new int3(coord.x + 1, coord.y, coord.z);
+                int3 xn = new int3(coord.x - 1, coord.y, coord.z);
+                int3 yp = new int3(coord.x, coord.y + 1, coord.z);
+                int3 yn = new int3(coord.x, coord.y - 1, coord.z);
+                int3 zp = new int3(coord.x, coord.y, coord.z + 1);
+                int3 zn = new int3(coord.x, coord.y, coord.z - 1);
+
+                float sdf_xp = mesh.IsVoxelInBounds(xp) ? mesh.sdfValues[mesh.GetVoxelIndex(xp)] : maxSdf;
+                float sdf_xn = mesh.IsVoxelInBounds(xn) ? mesh.sdfValues[mesh.GetVoxelIndex(xn)] : maxSdf;
+                float sdf_yp = mesh.IsVoxelInBounds(yp) ? mesh.sdfValues[mesh.GetVoxelIndex(yp)] : maxSdf;
+                float sdf_yn = mesh.IsVoxelInBounds(yn) ? mesh.sdfValues[mesh.GetVoxelIndex(yn)] : maxSdf;
+                float sdf_zp = mesh.IsVoxelInBounds(zp) ? mesh.sdfValues[mesh.GetVoxelIndex(zp)] : maxSdf;
+                float sdf_zn = mesh.IsVoxelInBounds(zn) ? mesh.sdfValues[mesh.GetVoxelIndex(zn)] : maxSdf;
+
+                Vector3 normal = new Vector3(
+                    sdf_xp - sdf_xn,
+                    sdf_yp - sdf_yn,
+                    sdf_zp - sdf_zn
+                ).normalized;
+
+                if (normal.sqrMagnitude < 0.1f)
+                {
+                    return (Vector3.zero, Vector3.zero); // Gradient is too small
+                }
+
+                return (normal, point);
             }
             private static float EvaluateSplitPlane(MeshData mesh, Vector3 normal, Vector3 point)
             {
@@ -6007,7 +5910,7 @@ namespace Empart.EmberPart
                 var regionMesh = MeshBooleanOperations.BooleanIntersect(combinedMesh, regionBox.AABB);
                 if (regionMesh.vertices.Count < 4) continue;
                 regionMesh.Voxelize(settings);
-                regionMesh.ComputeSDF(settings.sdfMethod, settings.sdfIterationCount, settings.sdfSmoothingFactor);
+                regionMesh.ComputeSDF(settings);
                 var newHulls = DecomposeRegion(regionMesh, regionBox.partBudgetMax, ToUnitsFromMm(regionBox.epsilonMm));
                 regionHulls.Add(newHulls);
                 yield return null;
@@ -6021,7 +5924,7 @@ namespace Empart.EmberPart
             if (remainderMesh.vertices.Count >= 4)
             {
                 remainderMesh.Voxelize(settings);
-                remainderMesh.ComputeSDF(settings.sdfMethod, settings.sdfIterationCount, settings.sdfSmoothingFactor);
+                remainderMesh.ComputeSDF(settings);
                 regionHulls.Add(DecomposeRegion(remainderMesh, settings.maxHullCount, settings.errorTolerance));
             }
             // Flatten list
@@ -6195,9 +6098,9 @@ namespace Empart.EmberPart
         {
             var merged = MeshBooleanOperations.BooleanUnion(h1, h2);
             var hullMesh = new MeshData { vertices = merged.vertices, indices = merged.indices };
-            hullMesh.Voxelize(settings.voxelSize, settings.voxelizationStrategy, settings.voxelAdaptivity);
-            if (hullMesh.sdfValues.Length == 0) return float.MaxValue;
-            hullMesh.ComputeSDF();
+            hullMesh.Voxelize(settings);
+            if (!hullMesh.sdfValues.IsCreated || hullMesh.sdfValues.Length == 0) return float.MaxValue;
+            hullMesh.ComputeSDF(settings);
 
             float mergedConcavity = CalculateConcavity(hullMesh, merged);
             float volumeIncrease = merged.volume - (h1.volume + h2.volume);
