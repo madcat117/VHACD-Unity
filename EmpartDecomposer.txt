@@ -386,11 +386,20 @@ namespace Empart.EmberPart
             public int maxOptimizationIterations = 10;
             public bool enableVertexReduction = true;
             public float vertexReductionThreshold = 0.001f;
-            [Header("Debug Settings")]
+        [Header("Debug Visualization Settings")]
             public bool enableDetailedLogging = false;
-            public bool enableErrorHeatmap = false;
-            public bool enableWitnessVisualization = false;
-            public bool enableSplitPlaneVisualization = false;
+        [Tooltip("Shows the AABB of the BVH nodes.")]
+        public bool drawBvh = false;
+        [Tooltip("Shows the voxel grid.")]
+        public bool drawVoxels = false;
+        [Tooltip("Shows the computed SDF as a 3D texture (requires custom shader).")]
+        public bool drawSdf = false;
+        [Tooltip("Shows the witness points used for error calculation.")]
+        public bool drawWitnessPoints = false;
+        [Tooltip("Shows the split planes used during decomposition.")]
+        public bool drawSplitPlanes = false;
+        [Tooltip("Shows a heatmap of the mesh saliency.")]
+        public bool drawSaliencyHeatmap = false;
             // Additional settings for production readiness
             [Header("Additional Production Settings")]
             public bool enableCacheResults = false;
@@ -403,10 +412,17 @@ namespace Empart.EmberPart
             public bool enablePostProcessing = true;
             public int postProcessingIterations = 5;
             public float postProcessingThreshold = 0.005f;
+            public enum SDFGenerationMethod
+            {
+                Basic,
+                JumpFlooding
+            }
+
             [Header("Voxel Specific Settings")]
             public bool enableSDF = true;
+            public SDFGenerationMethod sdfMethod = SDFGenerationMethod.JumpFlooding;
             public float sdfResolutionFactor = 1.5f;
-            public int sdfIterationCount = 5;
+            public int sdfIterationCount = 5; // Used for smoothing/refinement
             public float sdfSmoothingFactor = 0.1f;
             // Additional settings for extended functionality
             [Header("Extended Optimization")]
@@ -419,6 +435,14 @@ namespace Empart.EmberPart
             public float smoothingLambda = 0.5f;
             public int smoothingIterations = 3;
             public bool enableBoundaryLocking = true;
+
+        [Header("Pre-Processing: Isotropic Remeshing")]
+        [Tooltip("Enable isotropic remeshing as a pre-processing step to improve mesh quality.")]
+        public bool enableIsotropicRemeshing = false;
+        [Tooltip("The target edge length for the remeshed output.")]
+        public float remeshTargetEdgeLength = 0.1f;
+        [Tooltip("Number of remeshing iterations to perform.")]
+        [Range(1, 10)] public int remeshIterations = 3;
         [Header("CoACD Settings")]
         [Tooltip("The primary ACD method to use for decomposition.")]
         public ACDSubroutineType acdMethod = ACDSubroutineType.CoACD;
@@ -434,6 +458,18 @@ namespace Empart.EmberPart
         public int maxFeatureSamples = 500;
         [Tooltip("Angle threshold for detecting sharp edges.")]
         public float sharpEdgeAngle = 45f;
+
+        public enum SaliencyMethod
+        {
+            Curvature,
+            Geodesic,
+            HeatDiffusion
+        }
+        [Header("Advanced Feature Detection")]
+        [Tooltip("Method to use for calculating mesh saliency.")]
+        public SaliencyMethod saliencyMethod = SaliencyMethod.HeatDiffusion;
+        [Tooltip("Number of iterations for the heat diffusion simulation.")]
+        [Range(1, 20)] public int heatDiffusionIterations = 10;
             /// <summary>
             /// Apply quality preset settings
             /// </summary>
@@ -989,60 +1025,237 @@ namespace Empart.EmberPart
                 }
             }
             /// <summary>
-            /// Calculate vertex saliency
+            /// Calculate vertex saliency using the specified method.
             /// </summary>
-            public void CalculateSaliency()
+            public void CalculateSaliency(ConvexDecompositionSettings.SaliencyMethod method, int heatIterations = 10)
             {
-                if (curvature == null || curvature.Count != vertices.Count)
+                vertexSaliency = new List<float>(new float[vertices.Count]);
+                triangleSaliency = new List<float>(new float[triangleCount]);
+
+                switch(method)
                 {
-                    CalculateCurvature();
+                    case ConvexDecompositionSettings.SaliencyMethod.HeatDiffusion:
+                        var heat = Geodesic.CalculateHeat(this, heatIterations);
+                        float maxHeat = 0;
+                        for(int i=0; i<heat.Count; i++) maxHeat = Mathf.Max(maxHeat, heat[i]);
+                        if(maxHeat > 0)
+                        {
+                            for(int i=0; i<heat.Count; i++) vertexSaliency[i] = heat[i] / maxHeat;
+                        }
+                        break;
+
+                    case ConvexDecompositionSettings.SaliencyMethod.Geodesic:
+                         // Placeholder for a more complex geodesic saliency metric
+                         // For now, we'll fall back to curvature.
+                    case ConvexDecompositionSettings.SaliencyMethod.Curvature:
+                    default:
+                        if (curvature == null || curvature.Count != vertices.Count) CalculateCurvature();
+                        float maxCurvature = 0f;
+                        for (int i = 0; i < vertices.Count; i++)
+                        {
+                            vertexSaliency[i] = curvature[i].magnitude;
+                            maxCurvature = Mathf.Max(maxCurvature, vertexSaliency[i]);
+                        }
+                        if (maxCurvature > 0f)
+                        {
+                            for (int i = 0; i < vertices.Count; i++) vertexSaliency[i] /= maxCurvature;
+                        }
+                        break;
                 }
-                vertexSaliency = new List<float>(vertices.Count);
-                triangleSaliency = new List<float>(triangleCount);
-                // Calculate vertex saliency based on curvature magnitude
-                float maxCurvature = 0f;
-                for (int i = 0; i < vertices.Count; i++)
-                {
-                    vertexSaliency.Add(curvature[i].magnitude);
-                    maxCurvature = Mathf.Max(maxCurvature, vertexSaliency[i]);
-                }
-                // Normalize saliency
-                if (maxCurvature > 0f)
-                {
-                    for (int i = 0; i < vertices.Count; i++)
-                    {
-                        vertexSaliency[i] /= maxCurvature;
-                    }
-                }
-                // Calculate triangle saliency as average of vertex saliency
+
+                // Calculate triangle saliency as the average of its vertex saliencies
                 for (int i = 0; i < indices.Count; i += 3)
                 {
                     int triIndex = i / 3;
-                    triangleSaliency[triIndex] = (
-                        vertexSaliency[indices[i]] +
-                        vertexSaliency[indices[i + 1]] +
-                        vertexSaliency[indices[i + 2]]
-                    ) / 3f;
+                    triangleSaliency[triIndex] = (vertexSaliency[indices[i]] + vertexSaliency[indices[i+1]] + vertexSaliency[indices[i+2]]) / 3.0f;
                 }
-                // Additional: Weight by area
-                for (int i = 0; i < indices.Count; i += 3)
+            }
+        }
+
+        /// <summary>
+        /// Provides methods for computing geodesic distances and related properties on a mesh.
+        /// Uses the "Heat Method" for a fast and robust calculation.
+        /// </summary>
+        public static class Geodesic
+        {
+            // The heat method involves solving two linear systems. For a production Unity script
+            // without external libraries, we'll use an iterative solver (Jacobi method)
+            // which can be implemented with Burst and Jobs.
+
+            [BurstCompile]
+            private struct JacobiSolverJob : IJobParallelFor
+            {
+                [ReadOnly] public NativeArray<float> A_values; // Flattened Laplacian matrix
+                [ReadOnly] public NativeArray<int> A_indices;
+                [ReadOnly] public NativeArray<int> A_pointers;
+                [ReadOnly] public NativeArray<float> b; // Right-hand side vector
+                public NativeArray<float> x; // Solution vector (e.g., heat or distance)
+                [ReadOnly] public int iterations;
+
+                public void Execute(int index)
                 {
-                    int triIndex = i / 3;
-                    var a = vertices[indices[i]];
-                    var b = vertices[indices[i + 1]];
-                    var c = vertices[indices[i + 2]];
-                    float area = Vector3.Cross(b - a, c - a).magnitude / 2f;
-                    triangleSaliency[triIndex] *= area;
-                }
-                // Additional: Normalize triangle saliency
-                float maxTriSaliency = triangleSaliency.Max();
-                if (maxTriSaliency > 0)
-                {
-                    for (int j = 0; j < triangleSaliency.Count; j++)
+                    for (int iter = 0; iter < iterations; iter++)
                     {
-                        triangleSaliency[j] /= maxTriSaliency;
+                        float sigma = 0;
+                        int row_start = A_pointers[index];
+                        int row_end = A_pointers[index + 1];
+
+                        for(int j = row_start; j < row_end; j++)
+                        {
+                            int col = A_indices[j];
+                            if(col != index)
+                            {
+                                sigma += A_values[j] * x[col];
+                            }
+                        }
+
+                        float a_ii = 0;
+                        for(int j = row_start; j < row_end; j++) { if(A_indices[j] == index) a_ii = A_values[j]; }
+
+                        if(Mathf.Abs(a_ii) > 1e-6)
+                        {
+                           x[index] = (b[index] - sigma) / a_ii;
+                        }
                     }
                 }
+            }
+
+            public static List<float> CalculateHeat(MeshData mesh, int iterations)
+            {
+                int n = mesh.vertexCount;
+                var L = BuildCotanLaplacian(mesh);
+                var M = BuildMassMatrix(mesh);
+
+                var heat = new NativeArray<float>(n, Allocator.TempJob);
+                // Initial condition: heat source at a random vertex
+                heat[UnityEngine.Random.Range(0, n)] = 1.0f;
+
+                // Time-stepping (implicit Euler)
+                // (M - t*L)u_t = u_t-1
+                // This forms a linear system Ax = b where A = M - t*L, x = u_t, b = u_t-1
+                float t = Mathf.Pow(mesh.averageEdgeLength, 2);
+                var A = new SparseMatrix(n, n);
+                for(int i=0; i<n; i++)
+                {
+                    A.Set(i,i, M.Get(i,i) - t * L.Get(i,i));
+                    var neighbors = L.GetRow(i);
+                    foreach(var neighbor in neighbors)
+                    {
+                         A.Set(i, neighbor.Key, -t * neighbor.Value);
+                    }
+                }
+
+                var solver = new JacobiSolverJob
+                {
+                    A_values = A.values,
+                    A_indices = A.indices,
+                    A_pointers = A.pointers,
+                    b = heat,
+                    x = new NativeArray<float>(n, Allocator.TempJob),
+                    iterations = iterations
+                };
+                solver.Schedule(n, 64).Complete();
+
+                var result = new List<float>(solver.x.ToArray());
+
+                heat.Dispose();
+                solver.x.Dispose();
+                A.Dispose();
+                M.Dispose();
+                L.Dispose();
+
+                return result;
+            }
+
+            private static SparseMatrix BuildCotanLaplacian(MeshData mesh)
+            {
+                var L = new SparseMatrix(mesh.vertexCount, mesh.vertexCount);
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    Vector3 p0 = mesh.vertices[i0], p1 = mesh.vertices[i1], p2 = mesh.vertices[i2];
+
+                    float cot_alpha = Vector3.Dot(p1 - p0, p2 - p0) / Vector3.Cross(p1 - p0, p2 - p0).magnitude;
+                    float cot_beta = Vector3.Dot(p2 - p1, p0 - p1) / Vector3.Cross(p2 - p1, p0 - p1).magnitude;
+                    float cot_gamma = Vector3.Dot(p0 - p2, p1 - p2) / Vector3.Cross(p0 - p2, p1 - p2).magnitude;
+
+                    L.Add(i0, i1, -cot_gamma); L.Add(i1, i0, -cot_gamma);
+                    L.Add(i1, i2, -cot_alpha); L.Add(i2, i1, -cot_alpha);
+                    L.Add(i2, i0, -cot_beta); L.Add(i0, i2, -cot_beta);
+
+                    L.Add(i0, i0, cot_beta + cot_gamma);
+                    L.Add(i1, i1, cot_alpha + cot_gamma);
+                    L.Add(i2, i2, cot_alpha + cot_beta);
+                }
+                return L;
+            }
+
+            private static SparseMatrix BuildMassMatrix(MeshData mesh)
+            {
+                var M = new SparseMatrix(mesh.vertexCount, mesh.vertexCount);
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    Vector3 p0 = mesh.vertices[i0], p1 = mesh.vertices[i1], p2 = mesh.vertices[i2];
+                    float area = Vector3.Cross(p1-p0, p2-p0).magnitude / 2.0f;
+                    M.Add(i0, i0, area / 3.0f);
+                    M.Add(i1, i1, area / 3.0f);
+                    M.Add(i2, i2, area / 3.0f);
+                }
+                return M;
+            }
+        }
+
+        /// <summary>
+        /// A simple sparse matrix implementation using CSR format for use with Burst/Jobs.
+        /// </summary>
+        public class SparseMatrix : IDisposable
+        {
+            public NativeArray<float> values;
+            public NativeArray<int> indices; // column indices
+            public NativeArray<int> pointers; // row pointers
+            private Dictionary<int, float>[] rows;
+            private int n, m;
+
+            public SparseMatrix(int n_rows, int n_cols)
+            {
+                this.n = n_rows;
+                this.m = n_cols;
+                rows = new Dictionary<int, float>[n];
+                for(int i=0; i<n; i++) rows[i] = new Dictionary<int, float>();
+            }
+
+            public void Set(int r, int c, float val) { rows[r][c] = val; }
+            public void Add(int r, int c, float val) { rows[r][c] = Get(r,c) + val; }
+            public float Get(int r, int c) { return rows[r].TryGetValue(c, out float v) ? v : 0; }
+            public Dictionary<int, float> GetRow(int r) { return rows[r]; }
+
+            public void ToNativeArrays()
+            {
+                int nnz = rows.Sum(row => row.Count);
+                values = new NativeArray<float>(nnz, Allocator.TempJob);
+                indices = new NativeArray<int>(nnz, Allocator.TempJob);
+                pointers = new NativeArray<int>(n + 1, Allocator.TempJob);
+
+                int val_idx = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    pointers[i] = val_idx;
+                    foreach (var pair in rows[i].OrderBy(p => p.Key))
+                    {
+                        values[val_idx] = pair.Value;
+                        indices[val_idx] = pair.Key;
+                        val_idx++;
+                    }
+                }
+                pointers[n] = val_idx;
+            }
+
+            public void Dispose()
+            {
+                if(values.IsCreated) values.Dispose();
+                if(indices.IsCreated) indices.Dispose();
+                if(pointers.IsCreated) pointers.Dispose();
             }
             /// <summary>
             /// Identify sharp edges
@@ -1452,35 +1665,46 @@ namespace Empart.EmberPart
             /// <summary>
             /// Compute SDF from voxel grid
             /// </summary>
-            public void ComputeSDF(int iterations = 5, float smoothing = 0.1f)
+            public void ComputeSDF(ConvexDecompositionSettings.SDFGenerationMethod method, int iterations = 5, float smoothing = 0.1f)
             {
-                // Use fast marching method or iterative smoothing for SDF
-                for (int iter = 0; iter < iterations; iter++)
+                if (!enableSDF || sdfValues.Length == 0) return;
+
+                switch (method)
                 {
-                    var newSDF = new NativeArray<float>(sdfValues, Allocator.Temp);
-                    for (int x = 1; x < voxelDimensions.x - 1; x++)
-                    {
-                        for (int y = 1; y < voxelDimensions.y - 1; y++)
+                    case ConvexDecompositionSettings.SDFGenerationMethod.JumpFlooding:
+                        JumpFlooding.GenerateSDF(this);
+                        break;
+                    case ConvexDecompositionSettings.SDFGenerationMethod.Basic:
+                    default:
+                        // Use fast marching method or iterative smoothing for SDF
+                        for (int iter = 0; iter < iterations; iter++)
                         {
-                            for (int z = 1; z < voxelDimensions.z - 1; z++)
+                            var newSDF = new NativeArray<float>(sdfValues, Allocator.Temp);
+                            for (int x = 1; x < voxelDimensions.x - 1; x++)
                             {
-                                int idx = GetVoxelIndex(new int3(x, y, z));
-                                float sum = 0f;
-                                int count = 0;
-                                // Neighbor offsets
-                                int3[] offsets = { new int3(1, 0, 0), new int3(-1, 0, 0), new int3(0, 1, 0), new int3(0, -1, 0), new int3(0, 0, 1), new int3(0, 0, -1) };
-                                foreach (var off in offsets)
+                                for (int y = 1; y < voxelDimensions.y - 1; y++)
                                 {
-                                    int nIdx = GetVoxelIndex(new int3(x, y, z) + off);
-                                    sum += sdfValues[nIdx];
-                                    count++;
+                                    for (int z = 1; z < voxelDimensions.z - 1; z++)
+                                    {
+                                        int idx = GetVoxelIndex(new int3(x, y, z));
+                                        float sum = 0f;
+                                        int count = 0;
+                                        // Neighbor offsets
+                                        int3[] offsets = { new int3(1, 0, 0), new int3(-1, 0, 0), new int3(0, 1, 0), new int3(0, -1, 0), new int3(0, 0, 1), new int3(0, 0, -1) };
+                                        foreach (var off in offsets)
+                                        {
+                                            int nIdx = GetVoxelIndex(new int3(x, y, z) + off);
+                                            sum += sdfValues[nIdx];
+                                            count++;
+                                        }
+                                        newSDF[idx] = sdfValues[idx] * (1 - smoothing) + (sum / count) * smoothing;
+                                    }
                                 }
-                                newSDF[idx] = sdfValues[idx] * (1 - smoothing) + (sum / count) * smoothing;
                             }
+                            sdfValues.CopyFrom(newSDF);
+                            newSDF.Dispose();
                         }
-                    }
-                    sdfValues.CopyFrom(newSDF);
-                    newSDF.Dispose();
+                        break;
                 }
             }
             /// <summary>
@@ -2585,18 +2809,19 @@ namespace Empart.EmberPart
                     isValid = false;
                     return;
                 }
-                // Check if hull is convex
-                if (!IsConvex())
+
+                if (!IsConvex() || !IsClosed() || !IsManifold())
                 {
-                    isValid = false;
-                    return;
+                    if (enableDetailedLoggingStatic) Debug.LogWarning("Hull is not manifold, attempting repair.");
+                    RepairManifold();
+                    // Re-validate after repair
+                    if (!IsConvex() || !IsClosed() || !IsManifold())
+                    {
+                        isValid = false;
+                        return;
+                    }
                 }
-                // Check if hull is closed
-                if (!IsClosed())
-                {
-                    isValid = false;
-                    return;
-                }
+
                 // Check for degenerate triangles
                 for (int i = 0; i < indices.Count; i += 3)
                 {
@@ -2683,6 +2908,28 @@ namespace Empart.EmberPart
                 }
                 return true;
             }
+            private bool IsManifold()
+            {
+                var edgeCountDict = new Dictionary<(int, int), int>();
+                for (int i = 0; i < indices.Count; i += 3)
+                {
+                    for (int j = 0; j < 3; j++)
+                    {
+                        int v1 = indices[i + j];
+                        int v2 = indices[i + (j + 1) % 3];
+                        if (v1 > v2) (v1, v2) = (v2, v1);
+                        var edge = (v1, v2);
+                        if (edgeCountDict.ContainsKey(edge)) edgeCountDict[edge]++;
+                        else edgeCountDict[edge] = 1;
+                    }
+                }
+                foreach (var count in edgeCountDict.Values)
+                {
+                    if (count > 2) return false; // Edge shared by more than 2 faces
+                }
+                return true;
+            }
+
             private bool IsClosed()
             {
                 var edgeCountDict = new Dictionary<(int, int), int>();
@@ -3049,6 +3296,30 @@ namespace Empart.EmberPart
                 int F = indices.Count / 3;
                 eulerCharacteristic = V - E + F;
                 genus = (2 - eulerCharacteristic) / 2;
+            }
+
+            private void RepairManifold()
+            {
+                // 1. Remove duplicate triangles
+                var triSet = new HashSet<string>();
+                var newIndices = new List<int>();
+                for(int i=0; i<indices.Count; i+=3)
+                {
+                    var tri = new int[]{indices[i], indices[i+1], indices[i+2]};
+                    Array.Sort(tri);
+                    var key = $"{tri[0]}_{tri[1]}_{tri[2]}";
+                    if(triSet.Add(key))
+                    {
+                        newIndices.AddRange(tri);
+                    }
+                }
+                indices = newIndices;
+
+                // 2. Fill holes
+                FillHoles();
+
+                // 3. Re-calculate properties after repair
+                CalculateProperties();
             }
         }
         /// <summary>
@@ -3892,6 +4163,21 @@ namespace Empart.EmberPart
                 FindClosestTriangleRecursive(point, root, ref minDist, ref closestTri);
                 return closestTri;
             }
+            public void DrawGizmos()
+            {
+                if (root == null) return;
+                DrawGizmosRecursive(root);
+            }
+
+            private void DrawGizmosRecursive(Node node)
+            {
+                if (node == null) return;
+                Gizmos.color = Color.Lerp(Color.green, Color.red, node.depth / (float)maxDepth);
+                Gizmos.DrawWireCube(node.bounds.center, node.bounds.size);
+                if (node.left != null) DrawGizmosRecursive(node.left);
+                if (node.right != null) DrawGizmosRecursive(node.right);
+            }
+
             private void FindClosestTriangleRecursive(Vector3 point, Node node, ref float minDist, ref int closestTri)
             {
                 if (node.isLeaf)
@@ -4402,9 +4688,657 @@ namespace Empart.EmberPart
                 return unionMesh;
             }
         }
+
+        /// <summary>
+        /// Isotropic Remeshing implementation to regularize mesh geometry before decomposition.
+        /// This is a crucial pre-processing step for high-quality results.
+        /// </summary>
+        public static class IsotropicRemesher
+        {
+            public static void Remesh(MeshData mesh, float targetEdgeLength, int iterations)
+            {
+                if (mesh == null || mesh.vertexCount == 0) return;
+
+                var originalMesh = new MeshData // Keep a copy for surface projection
+                {
+                    vertices = new List<Vector3>(mesh.vertices),
+                    indices = new List<int>(mesh.indices)
+                };
+                originalMesh.BuildAccelerationStructure();
+
+                float minEdgeLength = 4.0f / 5.0f * targetEdgeLength;
+                float maxEdgeLength = 4.0f / 3.0f * targetEdgeLength;
+
+                for (int i = 0; i < iterations; i++)
+                {
+                    SplitLongEdges(mesh, maxEdgeLength);
+                    CollapseShortEdges(mesh, minEdgeLength);
+                    FlipEdges(mesh);
+                    TangentialRelaxation(mesh, originalMesh);
+                }
+                mesh.CalculateProperties(); // Recalculate all mesh properties after remeshing.
+            }
+
+            private static void SplitLongEdges(MeshData mesh, float maxLength)
+            {
+                var edges = GetEdges(mesh);
+                var maxLengthSq = maxLength * maxLength;
+
+                for (int i = 0; i < edges.Count; i++)
+                {
+                    var edge = edges[i];
+                    var p0 = mesh.vertices[edge.Item1];
+                    var p1 = mesh.vertices[edge.Item2];
+
+                    if ((p1 - p0).sqrMagnitude > maxLengthSq)
+                    {
+                        var midpoint = (p0 + p1) / 2.0f;
+                        int midVertexIndex = mesh.vertices.Count;
+                        mesh.vertices.Add(midpoint);
+
+                        var trianglesToSplit = FindTrianglesWithEdge(mesh, edge.Item1, edge.Item2);
+
+                        foreach(var triIdx in trianglesToSplit)
+                        {
+                            int v0 = mesh.indices[triIdx];
+                            int v1 = mesh.indices[triIdx + 1];
+                            int v2 = mesh.indices[triIdx + 2];
+                            int thirdVertex = -1;
+
+                            if (v0 != edge.Item1 && v0 != edge.Item2) thirdVertex = v0;
+                            else if (v1 != edge.Item1 && v1 != edge.Item2) thirdVertex = v1;
+                            else thirdVertex = v2;
+
+                            mesh.indices.RemoveRange(triIdx, 3);
+                            mesh.indices.Add(edge.Item1);
+                            mesh.indices.Add(midVertexIndex);
+                            mesh.indices.Add(thirdVertex);
+
+                            mesh.indices.Add(midVertexIndex);
+                            mesh.indices.Add(edge.Item2);
+                            mesh.indices.Add(thirdVertex);
+                        }
+                    }
+                }
+            }
+
+            private static void CollapseShortEdges(MeshData mesh, float minLength)
+            {
+                var edges = GetEdges(mesh);
+                var minLengthSq = minLength * minLength;
+                var deletedTris = new bool[mesh.indices.Count / 3];
+                var vertexRemap = new int[mesh.vertexCount];
+                for (int i = 0; i < mesh.vertexCount; i++) vertexRemap[i] = i;
+
+                foreach (var edge in edges)
+                {
+                    int u_orig = edge.Item1;
+                    int v_orig = edge.Item2;
+
+                    int u = vertexRemap[u_orig];
+                    int v = vertexRemap[v_orig];
+
+                    if (u == v) continue;
+
+                    if ((mesh.vertices[v] - mesh.vertices[u]).sqrMagnitude < minLengthSq)
+                    {
+                        // Check if collapse is valid
+                        if (!IsCollapseValid(mesh, u, v)) continue;
+
+                        // Collapse v into u
+                        var trianglesToRemove = FindTrianglesWithEdge(mesh, u, v);
+                        foreach(var triIdx in trianglesToRemove)
+                        {
+                            deletedTris[triIdx / 3] = true;
+                        }
+
+                        // Remap all triangles using v to use u instead
+                        for(int i = 0; i < mesh.indices.Count; i++)
+                        {
+                            if (vertexRemap[mesh.indices[i]] == v)
+                            {
+                                mesh.indices[i] = u;
+                            }
+                        }
+                        vertexRemap[v] = u;
+                    }
+                }
+
+                // Rebuild the index buffer
+                var newIndices = new List<int>();
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    if (deletedTris[i / 3]) continue;
+
+                    int i0 = mesh.indices[i];
+                    int i1 = mesh.indices[i+1];
+                    int i2 = mesh.indices[i+2];
+
+                    if (i0 != i1 && i1 != i2 && i0 != i2) // Remove degenerate triangles
+                    {
+                        newIndices.Add(i0);
+                        newIndices.Add(i1);
+                        newIndices.Add(i2);
+                    }
+                }
+                mesh.indices = newIndices;
+                mesh.Optimize(); // Clean up unused vertices
+            }
+
+            private static bool IsCollapseValid(MeshData mesh, int u, int v)
+            {
+                // Find one-ring neighbors of u and v
+                var neighborsU = GetOneRingNeighbors(mesh, u);
+                var neighborsV = GetOneRingNeighbors(mesh, v);
+
+                // Find common neighbors
+                var commonNeighbors = neighborsU.Intersect(neighborsV).ToList();
+                if (commonNeighbors.Count != 2)
+                {
+                    // This collapse would create a non-manifold topology (e.g., edge is not part of exactly two triangles)
+                    return false;
+                }
+
+                // Check for normal flipping on adjacent faces
+                var trisU = FindTrianglesWithVertex(mesh, u);
+                foreach(var triIdx in trisU)
+                {
+                    if (FindTrianglesWithVertex(mesh, v).Contains(triIdx)) continue; // Skip common triangles
+
+                    var v0_idx = mesh.indices[triIdx];
+                    var v1_idx = mesh.indices[triIdx + 1];
+                    var v2_idx = mesh.indices[triIdx + 2];
+
+                    var n_before = Vector3.Cross(mesh.vertices[v1_idx] - mesh.vertices[v0_idx], mesh.vertices[v2_idx] - mesh.vertices[v0_idx]);
+
+                    if (v0_idx == u) v0_idx = v;
+                    if (v1_idx == u) v1_idx = v;
+                    if (v2_idx == u) v2_idx = v;
+
+                    var n_after = Vector3.Cross(mesh.vertices[v1_idx] - mesh.vertices[v0_idx], mesh.vertices[v2_idx] - mesh.vertices[v0_idx]);
+
+                    if (Vector3.Dot(n_before, n_after) < 0.5f) // Heuristic threshold for normal flip
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            private static List<int> GetOneRingNeighbors(MeshData mesh, int vertexIndex)
+            {
+                var neighbors = new List<int>();
+                for(int i=0; i<mesh.indices.Count; i+=3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    if(i0 == vertexIndex) { neighbors.Add(i1); neighbors.Add(i2); }
+                    if(i1 == vertexIndex) { neighbors.Add(i0); neighbors.Add(i2); }
+                    if(i2 == vertexIndex) { neighbors.Add(i0); neighbors.Add(i1); }
+                }
+                return neighbors.Distinct().ToList();
+            }
+
+             private static List<int> FindTrianglesWithVertex(MeshData mesh, int v)
+            {
+                var tris = new List<int>();
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    if (mesh.indices[i] == v || mesh.indices[i+1] == v || mesh.indices[i+2] == v)
+                    {
+                        tris.Add(i);
+                    }
+                }
+                return tris;
+            }
+
+            private static void FlipEdges(MeshData mesh)
+            {
+                var edges = GetEdges(mesh);
+                var edgeToTriangles = GetEdgeToTriangleMap(mesh);
+
+                for (int i = 0; i < edges.Count; i++)
+                {
+                    var edge = edges[i];
+                    if (!edgeToTriangles.ContainsKey(edge) || edgeToTriangles[edge].Count != 2)
+                    {
+                        continue; // Boundary edge, cannot flip
+                    }
+
+                    var t1_idx = edgeToTriangles[edge][0];
+                    var t2_idx = edgeToTriangles[edge][1];
+
+                    var t1 = new int[] { mesh.indices[t1_idx], mesh.indices[t1_idx + 1], mesh.indices[t1_idx + 2] };
+                    var t2 = new int[] { mesh.indices[t2_idx], mesh.indices[t2_idx + 1], mesh.indices[t2_idx + 2] };
+
+                    int v0 = edge.Item1;
+                    int v1 = edge.Item2;
+                    int v2 = -1, v3 = -1;
+
+                    // Find the other two vertices of the quadrilateral
+                    foreach(int v_idx in t1) if (v_idx != v0 && v_idx != v1) v2 = v_idx;
+                    foreach(int v_idx in t2) if (v_idx != v0 && v_idx != v1) v3 = v_idx;
+
+                    if (v2 == -1 || v3 == -1) continue;
+
+                    // Check if the new edge (v2, v3) already exists
+                    if (edgeToTriangles.ContainsKey(v2 < v3 ? (v2, v3) : (v3, v2))) continue;
+
+                    // Lawson's criterion: flip if it improves the minimum angle
+                    float minAngleBefore = Mathf.Min(CalculateMinAngle(mesh, t1), CalculateMinAngle(mesh, t2));
+
+                    var new_t1 = new int[] { v0, v2, v3 };
+                    var new_t2 = new int[] { v1, v3, v2 };
+
+                    float minAngleAfter = Mathf.Min(CalculateMinAngle(mesh, new_t1), CalculateMinAngle(mesh, new_t2));
+
+                    if (minAngleAfter > minAngleBefore)
+                    {
+                        // Flip the edge
+                        mesh.indices[t1_idx] = new_t1[0];
+                        mesh.indices[t1_idx + 1] = new_t1[1];
+                        mesh.indices[t1_idx + 2] = new_t1[2];
+
+                        mesh.indices[t2_idx] = new_t2[0];
+                        mesh.indices[t2_idx + 1] = new_t2[1];
+                        mesh.indices[t2_idx + 2] = new_t2[2];
+                    }
+                }
+            }
+
+            private static float CalculateMinAngle(MeshData mesh, int[] tri)
+            {
+                Vector3 p0 = mesh.vertices[tri[0]];
+                Vector3 p1 = mesh.vertices[tri[1]];
+                Vector3 p2 = mesh.vertices[tri[2]];
+
+                float a = (p1-p0).magnitude;
+                float b = (p2-p1).magnitude;
+                float c = (p0-p2).magnitude;
+
+                float angle1 = Mathf.Acos((b*b + c*c - a*a) / (2*b*c));
+                float angle2 = Mathf.Acos((a*a + c*c - b*b) / (2*a*c));
+                float angle3 = Mathf.Acos((a*a + b*b - c*c) / (2*a*b));
+
+                return Mathf.Min(angle1, angle2, angle3) * Mathf.Rad2Deg;
+            }
+
+            private static Dictionary<(int, int), List<int>> GetEdgeToTriangleMap(MeshData mesh)
+            {
+                var map = new Dictionary<(int, int), List<int>>();
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    for (int j = 0; j < 3; j++)
+                    {
+                        int v1 = mesh.indices[i + j];
+                        int v2 = mesh.indices[i + ((j + 1) % 3)];
+                        var edge = v1 < v2 ? (v1, v2) : (v2, v1);
+                        if (!map.ContainsKey(edge)) map[edge] = new List<int>();
+                        map[edge].Add(i);
+                    }
+                }
+                return map;
+            }
+
+            private static void TangentialRelaxation(MeshData mesh, MeshData originalMesh)
+            {
+                var newPositions = new List<Vector3>(mesh.vertices);
+                var adj = BuildAdjacency(mesh);
+
+                for (int i = 0; i < mesh.vertices.Count; i++)
+                {
+                    var neighbors = adj[i];
+                    if (neighbors.Count == 0) continue;
+
+                    var centroid = Vector3.zero;
+                    foreach(var nIdx in neighbors)
+                    {
+                        centroid += mesh.vertices[nIdx];
+                    }
+                    centroid /= neighbors.Count;
+
+                    var newPos = ProjectToSurface(centroid, originalMesh);
+                    newPositions[i] = newPos;
+                }
+                mesh.vertices = newPositions;
+            }
+
+            private static Vector3 ProjectToSurface(Vector3 point, MeshData targetMesh)
+            {
+                float closestDistSq = float.MaxValue;
+                Vector3 closestPoint = point;
+
+                // This is a slow projection. A BVH on the original mesh is required for performance.
+                for(int i=0; i<targetMesh.indices.Count; i+=3)
+                {
+                    var a = targetMesh.vertices[targetMesh.indices[i]];
+                    var b = targetMesh.vertices[targetMesh.indices[i+1]];
+                    var c = targetMesh.vertices[targetMesh.indices[i+2]];
+                    var p = ClosestPointOnTriangle(point, a, b, c);
+                    float distSq = (point - p).sqrMagnitude;
+                    if(distSq < closestDistSq)
+                    {
+                        closestDistSq = distSq;
+                        closestPoint = p;
+                    }
+                }
+                return closestPoint;
+            }
+             private static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
+            {
+                var ab = b - a; var ac = c - a; var ap = p - a;
+                float d1 = Vector3.Dot(ab, ap), d2 = Vector3.Dot(ac, ap);
+                if (d1 <= 0 && d2 <= 0) return a;
+
+                var bp = p - b; float d3 = Vector3.Dot(ab, bp), d4 = Vector3.Dot(ac, bp);
+                if (d3 >= 0 && d4 <= d3) return b;
+
+                float vc = d1 * d4 - d3 * d2;
+                if (vc <= 0 && d1 >= 0 && d3 <= 0) { float v = d1 / (d1 - d3); return a + v * ab; }
+
+                var cp = p - c; float d5 = Vector3.Dot(ab, cp), d6 = Vector3.Dot(ac, cp);
+                if (d6 >= 0 && d5 <= d6) return c;
+
+                float vb = d5 * d2 - d1 * d6;
+                if (vb <= 0 && d2 >= 0 && d6 <= 0) { float w = d2 / (d2 - d6); return a + w * ac; }
+
+                float va = d3 * d6 - d5 * d4;
+                if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) { float w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); return b + w * (c-b); }
+
+                float den = 1.0f / (va + vb + vc);
+                float v_ = vb * den;
+                float w_ = vc * den;
+                return a + ab * v_ + ac * w_;
+            }
+
+            private static List<(int, int)> GetEdges(MeshData mesh)
+            {
+                var edges = new HashSet<(int, int)>();
+                for(int i=0; i<mesh.indices.Count; i+=3)
+                {
+                    for(int j=0; j<3; j++)
+                    {
+                        int v1 = mesh.indices[i+j];
+                        int v2 = mesh.indices[i+((j+1)%3)];
+                        edges.Add(v1 < v2 ? (v1,v2) : (v2,v1));
+                    }
+                }
+                return edges.ToList();
+            }
+
+            private static List<int> FindTrianglesWithEdge(MeshData mesh, int v1, int v2)
+            {
+                var tris = new List<int>();
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    if ((i0 == v1 && i1 == v2) || (i1 == v1 && i0 == v2) ||
+                        (i1 == v1 && i2 == v2) || (i2 == v1 && i1 == v2) ||
+                        (i2 == v1 && i0 == v2) || (i0 == v1 && i2 == v2))
+                    {
+                        tris.Add(i);
+                    }
+                }
+                return tris;
+            }
+
+            private static Dictionary<int, List<int>> BuildAdjacency(MeshData mesh)
+            {
+                var adj = new Dictionary<int, List<int>>();
+                for(int i=0; i<mesh.vertexCount; i++) adj[i] = new List<int>();
+                for(int i=0; i<mesh.indices.Count; i+=3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    adj[i0].Add(i1); adj[i0].Add(i2);
+                    adj[i1].Add(i0); adj[i1].Add(i2);
+                    adj[i2].Add(i0); adj[i2].Add(i1);
+                }
+                for(int i=0; i<mesh.vertexCount; i++) adj[i] = adj[i].Distinct().ToList();
+                return adj;
+            }
+        }
+
         /// <summary>
         /// Split plane evaluator for finding optimal split planes
         /// </summary>
+        public static class JumpFlooding
+        {
+            [BurstCompile]
+            private struct SeedJob : IJobParallelFor
+            {
+                [ReadOnly] public NativeArray<Vector3> Vertices;
+                [ReadOnly] public NativeArray<int> Indices;
+                public NativeArray<int3> SeedLocations; // Stores the xyz of the closest seed
+                public int3 Dimensions;
+                public Bounds VoxelBounds;
+                public float3 VoxelSize;
+
+                public void Execute(int index)
+                {
+                    // Initialize with a marker for empty voxels
+                    SeedLocations[index] = new int3(-1, -1, -1);
+                }
+            }
+
+            [BurstCompile]
+            private struct JumpPassJob : IJobParallelFor
+            {
+                [ReadOnly] public NativeArray<int3> ReadSeedLocations;
+                public NativeArray<int3> WriteSeedLocations;
+                public int3 Dimensions;
+                public int Step;
+
+                public void Execute(int index)
+                {
+                    int3 p = new int3(index % Dimensions.x, (index / Dimensions.x) % Dimensions.y, index / (Dimensions.x * Dimensions.y));
+                    int3 bestSeed = ReadSeedLocations[index];
+                    float minDistSq = float.MaxValue;
+
+                    if(bestSeed.x != -1)
+                    {
+                        minDistSq = math.lengthsq(p - bestSeed);
+                    }
+
+                    for (int z = -1; z <= 1; z++)
+                    for (int y = -1; y <= 1; y++)
+                    for (int x = -1; x <= 1; x++)
+                    {
+                        if (x == 0 && y == 0 && z == 0) continue;
+
+                        int3 neighborP = p + new int3(x * Step, y * Step, z * Step);
+                        if (neighborP.x < 0 || neighborP.x >= Dimensions.x ||
+                            neighborP.y < 0 || neighborP.y >= Dimensions.y ||
+                            neighborP.z < 0 || neighborP.z >= Dimensions.z) continue;
+
+                        int neighborIdx = neighborP.x + Dimensions.x * (neighborP.y + Dimensions.y * neighborP.z);
+                        int3 neighborSeed = ReadSeedLocations[neighborIdx];
+
+                        if (neighborSeed.x != -1)
+                        {
+                            float distSq = math.lengthsq(p - neighborSeed);
+                            if (distSq < minDistSq)
+                            {
+                                minDistSq = distSq;
+                                bestSeed = neighborSeed;
+                            }
+                        }
+                    }
+                    WriteSeedLocations[index] = bestSeed;
+                }
+            }
+
+            [BurstCompile]
+            private struct FinalSDFJob : IJobParallelFor
+            {
+                [ReadOnly] public NativeArray<int3> SeedLocations;
+                public NativeArray<float> SDF;
+                public int3 Dimensions;
+                public float3 VoxelSize;
+
+                public void Execute(int index)
+                {
+                    int3 p = new int3(index % Dimensions.x, (index / Dimensions.x) % Dimensions.y, index / (Dimensions.x * Dimensions.y));
+                    int3 seed = SeedLocations[index];
+                    if (seed.x == -1)
+                    {
+                        SDF[index] = float.MaxValue;
+                    }
+                    else
+                    {
+                        float3 p_world = p * VoxelSize;
+                        float3 seed_world = seed * VoxelSize;
+                        SDF[index] = math.length(p_world - seed_world);
+                    }
+                }
+            }
+
+            [BurstCompile]
+            private struct SignPassJob : IJobParallelFor
+            {
+                [ReadOnly] public NativeArray<Vector3> Vertices;
+                [ReadOnly] public NativeArray<int> Indices;
+                public NativeArray<float> SDF;
+                public int3 Dimensions;
+                public Bounds VoxelBounds;
+                public float3 VoxelSize;
+
+                public void Execute(int index)
+                {
+                    float3 voxelCenter = VoxelBounds.min + new float3(index % Dimensions.x, (index / Dimensions.x) % Dimensions.y, index / (Dimensions.x * Dimensions.y)) * VoxelSize;
+
+                    int crossings = 0;
+                    float3 rayDir = new float3(1, 0.1f, 0.05f); // Jittered ray to avoid hitting edges/verts
+
+                    for(int i=0; i < Indices.Length; i+=3)
+                    {
+                        float3 v0 = Vertices[Indices[i]];
+                        float3 v1 = Vertices[Indices[i+1]];
+                        float3 v2 = Vertices[Indices[i+2]];
+
+                        if(RayTriangleIntersect(voxelCenter, rayDir, v0, v1, v2))
+                        {
+                            crossings++;
+                        }
+                    }
+
+                    if(crossings % 2 == 1) // Odd number of crossings means we are inside
+                    {
+                        SDF[index] *= -1.0f;
+                    }
+                }
+
+                // Moller-Trumbore intersection algorithm
+                private bool RayTriangleIntersect(float3 ro, float3 rd, float3 v0, float3 v1, float3 v2)
+                {
+                    float3 edge1 = v1 - v0;
+                    float3 edge2 = v2 - v0;
+                    float3 h = math.cross(rd, edge2);
+                    float a = math.dot(edge1, h);
+                    if (a > -1e-6 && a < 1e-6) return false; // Parallel
+
+                    float f = 1.0f / a;
+                    float3 s = ro - v0;
+                    float u = f * math.dot(s, h);
+                    if (u < 0.0 || u > 1.0) return false;
+
+                    float3 q = math.cross(s, edge1);
+                    float v = f * math.dot(rd, q);
+                    if (v < 0.0 || u + v > 1.0) return false;
+
+                    float t = f * math.dot(edge2, q);
+                    return t > 1e-6; // Epsilon check
+                }
+            }
+
+            public static void GenerateSDF(MeshData mesh)
+            {
+                int voxelCount = mesh.voxelDimensions.x * mesh.voxelDimensions.y * mesh.voxelDimensions.z;
+                var seedLocations = new NativeArray<int3>(voxelCount, Allocator.TempJob);
+                var tempSeedLocations = new NativeArray<int3>(voxelCount, Allocator.TempJob);
+
+                var vertices = new NativeArray<Vector3>(mesh.vertices.ToArray(), Allocator.TempJob);
+                var indices = new NativeArray<int>(mesh.indices.ToArray(), Allocator.TempJob);
+
+                // 1. Seeding Pass
+                var seedJob = new SeedJob
+                {
+                    Vertices = vertices,
+                    Indices = indices,
+                    SeedLocations = seedLocations,
+                    Dimensions = mesh.voxelDimensions,
+                    VoxelBounds = mesh.voxelBounds,
+                    VoxelSize = mesh.voxelBounds.size / new float3(mesh.voxelDimensions)
+                };
+                seedJob.Schedule(voxelCount, 64).Complete();
+
+                // This part is slow. A better approach would be to rasterize the triangles.
+                for(int i=0; i<mesh.indices.Count; i+=3)
+                {
+                    var v0 = mesh.vertices[mesh.indices[i]];
+                    var v1 = mesh.vertices[mesh.indices[i+1]];
+                    var v2 = mesh.vertices[mesh.indices[i+2]];
+                    var c0 = mesh.WorldToVoxel(v0);
+                    var c1 = mesh.WorldToVoxel(v1);
+                    var c2 = mesh.WorldToVoxel(v2);
+                    // Simple rasterization - mark voxels containing vertices
+                     if(mesh.IsVoxelInBounds(c0)) seedLocations[c0.x + c0.y * mesh.voxelDimensions.x + c0.z * mesh.voxelDimensions.x * mesh.voxelDimensions.y] = c0;
+                     if(mesh.IsVoxelInBounds(c1)) seedLocations[c1.x + c1.y * mesh.voxelDimensions.x + c1.z * mesh.voxelDimensions.x * mesh.voxelDimensions.y] = c1;
+                     if(mesh.IsVoxelInBounds(c2)) seedLocations[c2.x + c2.y * mesh.voxelDimensions.x + c2.z * mesh.voxelDimensions.x * mesh.voxelDimensions.y] = c2;
+                }
+
+                // 2. Jump Flooding Passes
+                int maxDim = math.max(mesh.voxelDimensions.x, math.max(mesh.voxelDimensions.y, mesh.voxelDimensions.z));
+                int step = (int)math.pow(2, math.floor(math.log2(maxDim)));
+
+                var read = seedLocations;
+                var write = tempSeedLocations;
+
+                while(step >= 1)
+                {
+                    var jumpJob = new JumpPassJob
+                    {
+                        ReadSeedLocations = read,
+                        WriteSeedLocations = write,
+                        Dimensions = mesh.voxelDimensions,
+                        Step = step
+                    };
+                    jumpJob.Schedule(voxelCount, 64).Complete();
+
+                    // Swap buffers
+                    var tmp = read;
+                    read = write;
+                    write = tmp;
+
+                    step /= 2;
+                }
+
+                // 3. Final Distance Calculation
+                var finalSDFJob = new FinalSDFJob
+                {
+                    SeedLocations = read,
+                    SDF = mesh.sdfValues,
+                    Dimensions = mesh.voxelDimensions,
+                    VoxelSize = mesh.voxelBounds.size / new float3(mesh.voxelDimensions)
+                };
+                finalSDFJob.Schedule(voxelCount, 64).Complete();
+
+                // 4. Sign Pass
+                var signPassJob = new SignPassJob
+                {
+                    Vertices = vertices,
+                    Indices = indices,
+                    SDF = mesh.sdfValues,
+                    Dimensions = mesh.voxelDimensions,
+                    VoxelBounds = mesh.voxelBounds,
+                    VoxelSize = mesh.voxelBounds.size / new float3(mesh.voxelDimensions)
+                };
+                signPassJob.Schedule(voxelCount, 64).Complete();
+
+                seedLocations.Dispose();
+                tempSeedLocations.Dispose();
+                vertices.Dispose();
+                indices.Dispose();
+            }
+        }
         public static class SplitPlaneEvaluator
         {
             public static (Vector3 normal, Vector3 point) FindBestSplitPlane(MeshData mesh, ConvexHull hull, float concavity)
@@ -4825,7 +5759,21 @@ namespace Empart.EmberPart
                 combinedMesh.indices.AddRange(triangles);
             }
             combinedMesh.Optimize();
+
+            if (settings.enableIsotropicRemeshing)
+            {
+                IsotropicRemesher.Remesh(combinedMesh, settings.remeshTargetEdgeLength, settings.remeshIterations);
+            }
+
             combinedMesh.CalculateProperties();
+
+            if (settings.acdMethod == ACDSubroutineType.CoACD)
+            {
+                combinedMesh.CalculateSaliency(settings.saliencyMethod, settings.heatDiffusionIterations);
+                combinedMesh.IdentifySharpEdges(settings.sharpEdgeAngle);
+                combinedMesh.IdentifyFeatureVertices();
+            }
+
             combinedMesh.BuildAccelerationStructure();
             metrics.originalMeshVolume = combinedMesh.volume;
             metrics.originalMeshSurfaceArea = combinedMesh.surfaceArea;
@@ -4859,7 +5807,7 @@ namespace Empart.EmberPart
                 var regionMesh = MeshBooleanOperations.BooleanIntersect(combinedMesh, regionBox.AABB);
                 if (regionMesh.vertices.Count < 4) continue;
                 regionMesh.Voxelize(settings.voxelSize, settings.voxelizationStrategy, settings.voxelAdaptivity);
-                regionMesh.ComputeSDF(settings.sdfIterationCount, settings.sdfSmoothingFactor);
+                regionMesh.ComputeSDF(settings.sdfMethod, settings.sdfIterationCount, settings.sdfSmoothingFactor);
                 var newHulls = DecomposeRegion(regionMesh, regionBox.partBudgetMax, ToUnitsFromMm(regionBox.epsilonMm));
                 regionHulls.Add(newHulls);
                 yield return null;
@@ -4873,7 +5821,7 @@ namespace Empart.EmberPart
             if (remainderMesh.vertices.Count >= 4)
             {
                 remainderMesh.Voxelize(settings.voxelSize, settings.voxelizationStrategy, settings.voxelAdaptivity);
-                remainderMesh.ComputeSDF(settings.sdfIterationCount, settings.sdfSmoothingFactor);
+                remainderMesh.ComputeSDF(settings.sdfMethod, settings.sdfIterationCount, settings.sdfSmoothingFactor);
                 regionHulls.Add(DecomposeRegion(remainderMesh, settings.maxHullCount, settings.errorTolerance));
             }
             // Flatten list
@@ -5198,56 +6146,96 @@ namespace Empart.EmberPart
         private void OnDrawGizmos()
         {
             if (!enableInteractiveMode || settings == null) return;
+
+            Gizmos.matrix = transform.localToWorldMatrix;
+
             if (showRegionBounds)
             {
                 Gizmos.color = Color.yellow;
                 foreach (var region in regionBoxes)
                 {
-                    Gizmos.matrix = transform.localToWorldMatrix;
                     Gizmos.DrawWireCube(region.AABB.center, region.AABB.size);
+                }
+            }
+
+            if (settings.drawBvh && combinedMesh?.accelerationStructure != null)
+            {
+                DecompositionDebug.DrawBvh(combinedMesh.accelerationStructure);
+            }
+            if (settings.drawVoxels && combinedMesh?.sdfValues.IsCreated == true)
+            {
+                DecompositionDebug.DrawVoxels(combinedMesh);
+            }
+            if (settings.drawWitnessPoints)
+            {
+                foreach(var hull in hulls)
+                {
+                    if(hull.witnessPoints != null) DecompositionDebug.DrawWitnessPoints(hull);
+                }
+            }
+            if (settings.drawSaliencyHeatmap && combinedMesh?.vertexSaliency != null)
+            {
+                DecompositionDebug.DrawSaliencyHeatmap(combinedMesh);
+            }
+        }
+    }
+
+    public static class DecompositionDebug
+    {
+        public static void DrawBvh(EmpartDecomposer.BVH bvh)
+        {
+            if (bvh == null) return;
+            bvh.DrawGizmos();
+        }
+
+        public static void DrawVoxels(EmpartDecomposer.MeshData mesh)
+        {
+            Gizmos.color = new Color(0, 1, 1, 0.1f);
+            for (int i = 0; i < mesh.sdfValues.Length; i++)
+            {
+                if (mesh.sdfValues[i] < 0) // Inside
+                {
+                    var coord = new int3(i % mesh.voxelDimensions.x, (i / mesh.voxelDimensions.x) % mesh.voxelDimensions.y, i / (mesh.voxelDimensions.x * mesh.voxelDimensions.y));
+                    var worldPos = mesh.VoxelToWorld(coord);
+                    Gizmos.DrawCube(worldPos, mesh.voxelBounds.size / new Vector3(mesh.voxelDimensions.x, mesh.voxelDimensions.y, mesh.voxelDimensions.z));
                 }
             }
         }
 
-        [ContextMenu("Run Smoke Test")]
-        public void RunSmokeTest()
+        public static void DrawWitnessPoints(EmpartDecomposer.ConvexHull hull)
         {
-            if (isProcessing)
+            Gizmos.color = Color.red;
+            foreach (var p in hull.witnessPoints)
             {
-                Debug.LogWarning("Cannot run smoke test while processing.");
-                return;
+                Gizmos.DrawSphere(p, 0.01f);
             }
-
-            // 1. Create a simple test mesh (e.g., a cube)
-            var testObject = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            sourceObject = testObject;
-
-            // 2. Use default settings
-            if (settings == null)
-            {
-                settings = ScriptableObject.CreateInstance<ConvexDecompositionSettings>();
-            }
-            settings.qualityPreset = QualityPreset.Medium;
-            settings.ApplyQualityPreset();
-
-            // 3. Run decomposition
-            Debug.Log("Starting smoke test...");
-            DecomposeMesh();
-
-            // 4. Check results (basic assertions)
-            StartCoroutine(CheckSmokeTestResults());
-
-            Destroy(testObject, 2.0f); // Cleanup test object
         }
 
-        private IEnumerator CheckSmokeTestResults()
+        public static void DrawSaliencyHeatmap(EmpartDecomposer.MeshData mesh)
         {
-            yield return new WaitUntil(() => !isProcessing);
-            Debug.Log("Smoke test decomposition finished.");
-            Assert.IsTrue(hulls.Count > 0, "Smoke test failed: No hulls were generated.");
-            Assert.IsTrue(hullObjects.Count > 0, "Smoke test failed: No hull game objects were created.");
-            Assert.IsTrue(metrics.totalTime > 0, "Smoke test failed: Metrics were not calculated.");
-            Debug.Log("Smoke test passed!");
+            if(mesh.vertexSaliency == null || mesh.vertexSaliency.Count == 0) return;
+            for(int i=0; i<mesh.indices.Count; i+=3)
+            {
+                var i0 = mesh.indices[i];
+                var i1 = mesh.indices[i+1];
+                var i2 = mesh.indices[i+2];
+
+                var v0 = mesh.vertices[i0];
+                var v1 = mesh.vertices[i1];
+                var v2 = mesh.vertices[i2];
+
+                var s0 = mesh.vertexSaliency[i0];
+                var s1 = mesh.vertexSaliency[i1];
+                var s2 = mesh.vertexSaliency[i2];
+
+                var avgSaliency = (s0 + s1 + s2) / 3.0f;
+                var color = Color.Lerp(Color.blue, Color.red, avgSaliency);
+
+                Gizmos.color = color;
+                Gizmos.DrawLine(v0, v1);
+                Gizmos.DrawLine(v1, v2);
+                Gizmos.DrawLine(v2, v0);
+            }
         }
     }
 }
