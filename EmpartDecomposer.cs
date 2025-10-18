@@ -478,6 +478,8 @@ namespace Empart.EmberPart
             [Header("Debug Visualization Settings")]
             [Tooltip("Enable verbose logging to the console.")]
             public bool enableDetailedLogging = false;
+            [Tooltip("Enable profiling and export metrics to CSV.")]
+            public bool enableProfiling = false;
             [Tooltip("Shows the AABB of the BVH nodes.")]
             public bool drawBvh = false;
             [Tooltip("Shows the voxel grid.")]
@@ -516,20 +518,11 @@ namespace Empart.EmberPart
             public int smoothingIterations = 3;
             [Tooltip("If true, boundary vertices will not be modified by smoothing.")]
             public bool enableBoundaryLocking = true;
+            [Tooltip("The error tolerance for post-processing simplification.")]
+            public float postProcessingThreshold = 0.01f;
+            [Tooltip("The conversion factor from millimeters to Unity units.")]
+            public float unitsPerMeter = 1.0f;
 
-            /// <summary>Defines the backend used for voxelization.</summary>
-            public enum VoxelizationMethod
-            {
-                /// <summary>A CPU-based method that only voxelizes the mesh surface.</summary>
-                CPU_Surface,
-                /// <summary>A CPU-based method that creates a solid voxel volume.</summary>
-                CPU_Solid,
-                /// <summary>A high-performance GPU-accelerated pipeline for voxelization and SDF generation.</summary>
-                GPU_Accelerated
-            }
-            [Header("Voxelization Method")]
-            [Tooltip("The primary method for generating the voxel representation.")]
-            public VoxelizationMethod voxelMethod = VoxelizationMethod.CPU_Solid;
 
             /// <summary>The algorithm used for generating the Signed Distance Field (SDF).</summary>
             public enum SDFGenerationMethod
@@ -745,13 +738,17 @@ namespace Empart.EmberPart
             public bool isManifold;
 
             /// <summary>The number of vertices in the mesh.</summary>
-            public int vertexCount;
+            public int vertexCount => vertices.Count;
             /// <summary>The number of triangles in the mesh.</summary>
-            public int triangleCount;
+            public int triangleCount => indices.Count / 3;
             /// <summary>The number of unique edges in the mesh.</summary>
             public int edgeCount;
             /// <summary>The average length of the edges in the mesh.</summary>
             public float averageEdgeLength;
+            /// <summary>The Euler characteristic of the mesh (V - E + F). A topological invariant.</summary>
+            public int eulerCharacteristic;
+            /// <summary>The genus of the mesh, which is the number of "handles" or "holes". Only valid for closed, manifold meshes.</summary>
+            public int genus;
 
             // Advanced Properties for CoACD and other algorithms
             /// <summary>The per-vertex curvature, used for feature detection.</summary>
@@ -766,6 +763,10 @@ namespace Empart.EmberPart
             public List<int> featureVertices;
             /// <summary>A Bounding Volume Hierarchy built from the mesh for fast spatial queries.</summary>
             public BVH accelerationStructure;
+            /// <summary>A list of normals for each edge in the mesh.</summary>
+            public List<Vector3> edgeNormals;
+            /// <summary>A dictionary for storing arbitrary custom data associated with the mesh.</summary>
+            public Dictionary<string, object> customAttributes = new Dictionary<string, object>();
 
             // Voxelization and SDF data
             /// <summary>The computed Signed Distance Field for this mesh.</summary>
@@ -803,9 +804,6 @@ namespace Empart.EmberPart
             /// </summary>
             public void CalculateProperties()
             {
-                vertexCount = vertices.Count;
-                triangleCount = indices.Count / 3;
-
                 // --- Calculate Bounds ---
                 bounds = new Bounds();
                 if (vertices.Count > 0)
@@ -841,6 +839,7 @@ namespace Empart.EmberPart
                 isClosed = IsMeshClosed();
                 isManifold = IsMeshManifold();
                 CalculateTopology();
+                BuildAccelerationStructure();
             }
             /// <summary>
             /// Calculates statistics about the mesh's edges, such as count and average length.
@@ -877,14 +876,17 @@ namespace Empart.EmberPart
                 // Additional: Calculate edge normals if needed
                 if (edgeNormals == null) edgeNormals = new List<Vector3>(edgeCount);
                 // Additional: Calculate variance of edge lengths
-                float variance = 0f;
-                foreach (var edge in edges)
+                if (edgeCount > 0)
                 {
-                    float length = Vector3.Distance(vertices[edge.Item1], vertices[edge.Item2]);
-                    variance += (length - averageEdgeLength) * (length - averageEdgeLength);
+                    float variance = 0f;
+                    foreach (var edge in edges)
+                    {
+                        float length = Vector3.Distance(vertices[edge.Item1], vertices[edge.Item2]);
+                        variance += (length - averageEdgeLength) * (length - averageEdgeLength);
+                    }
+                    variance /= edgeCount;
+                    customAttributes["EdgeLengthVariance"] = variance;
                 }
-                variance /= edgeCount;
-                customAttributes["EdgeLengthVariance"] = variance;
             }
             /// <summary>
             /// Determines if the mesh is "watertight" by checking if every edge is shared by exactly two triangles.
@@ -1207,193 +1209,7 @@ namespace Empart.EmberPart
                     triangleSaliency[triIndex] = (vertexSaliency[indices[i]] + vertexSaliency[indices[i+1]] + vertexSaliency[indices[i+2]]) / 3.0f;
                 }
             }
-        }
 
-        /// <summary>
-        /// Provides methods for computing geodesic distances and related properties on a mesh.
-        /// Uses the "Heat Method" for a fast and robust calculation.
-        /// </summary>
-        public static class Geodesic
-        {
-            // The heat method involves solving two linear systems. For a production Unity script
-            // without external libraries, we'll use an iterative solver (Jacobi method)
-            // which can be implemented with Burst and Jobs.
-
-            [BurstCompile]
-            private struct JacobiSolverJob : IJobParallelFor
-            {
-                [ReadOnly] public NativeArray<float> A_values; // Flattened Laplacian matrix
-                [ReadOnly] public NativeArray<int> A_indices;
-                [ReadOnly] public NativeArray<int> A_pointers;
-                [ReadOnly] public NativeArray<float> b; // Right-hand side vector
-                public NativeArray<float> x; // Solution vector (e.g., heat or distance)
-                [ReadOnly] public int iterations;
-
-                public void Execute(int index)
-                {
-                    for (int iter = 0; iter < iterations; iter++)
-                    {
-                        float sigma = 0;
-                        int row_start = A_pointers[index];
-                        int row_end = A_pointers[index + 1];
-
-                        for(int j = row_start; j < row_end; j++)
-                        {
-                            int col = A_indices[j];
-                            if(col != index)
-                            {
-                                sigma += A_values[j] * x[col];
-                            }
-                        }
-
-                        float a_ii = 0;
-                        for(int j = row_start; j < row_end; j++) { if(A_indices[j] == index) a_ii = A_values[j]; }
-
-                        if(Mathf.Abs(a_ii) > 1e-6)
-                        {
-                           x[index] = (b[index] - sigma) / a_ii;
-                        }
-                    }
-                }
-            }
-
-            public static List<float> CalculateHeat(MeshData mesh, int iterations)
-            {
-                int n = mesh.vertexCount;
-                var L = BuildCotanLaplacian(mesh);
-                var M = BuildMassMatrix(mesh);
-
-                var heat = new NativeArray<float>(n, Allocator.TempJob);
-                // Initial condition: heat source at a random vertex
-                heat[UnityEngine.Random.Range(0, n)] = 1.0f;
-
-                // Time-stepping (implicit Euler)
-                // (M - t*L)u_t = u_t-1
-                // This forms a linear system Ax = b where A = M - t*L, x = u_t, b = u_t-1
-                float t = Mathf.Pow(mesh.averageEdgeLength, 2);
-                var A = new SparseMatrix(n, n);
-                for(int i=0; i<n; i++)
-                {
-                    A.Set(i,i, M.Get(i,i) - t * L.Get(i,i));
-                    var neighbors = L.GetRow(i);
-                    foreach(var neighbor in neighbors)
-                    {
-                         A.Set(i, neighbor.Key, -t * neighbor.Value);
-                    }
-                }
-
-                var solver = new JacobiSolverJob
-                {
-                    A_values = A.values,
-                    A_indices = A.indices,
-                    A_pointers = A.pointers,
-                    b = heat,
-                    x = new NativeArray<float>(n, Allocator.TempJob),
-                    iterations = iterations
-                };
-                solver.Schedule(n, 64).Complete();
-
-                var result = new List<float>(solver.x.ToArray());
-
-                heat.Dispose();
-                solver.x.Dispose();
-                A.Dispose();
-                M.Dispose();
-                L.Dispose();
-
-                return result;
-            }
-
-            private static SparseMatrix BuildCotanLaplacian(MeshData mesh)
-            {
-                var L = new SparseMatrix(mesh.vertexCount, mesh.vertexCount);
-                for (int i = 0; i < mesh.indices.Count; i += 3)
-                {
-                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
-                    Vector3 p0 = mesh.vertices[i0], p1 = mesh.vertices[i1], p2 = mesh.vertices[i2];
-
-                    float cot_alpha = Vector3.Dot(p1 - p0, p2 - p0) / Vector3.Cross(p1 - p0, p2 - p0).magnitude;
-                    float cot_beta = Vector3.Dot(p2 - p1, p0 - p1) / Vector3.Cross(p2 - p1, p0 - p1).magnitude;
-                    float cot_gamma = Vector3.Dot(p0 - p2, p1 - p2) / Vector3.Cross(p0 - p2, p1 - p2).magnitude;
-
-                    L.Add(i0, i1, -cot_gamma); L.Add(i1, i0, -cot_gamma);
-                    L.Add(i1, i2, -cot_alpha); L.Add(i2, i1, -cot_alpha);
-                    L.Add(i2, i0, -cot_beta); L.Add(i0, i2, -cot_beta);
-
-                    L.Add(i0, i0, cot_beta + cot_gamma);
-                    L.Add(i1, i1, cot_alpha + cot_gamma);
-                    L.Add(i2, i2, cot_alpha + cot_beta);
-                }
-                return L;
-            }
-
-            private static SparseMatrix BuildMassMatrix(MeshData mesh)
-            {
-                var M = new SparseMatrix(mesh.vertexCount, mesh.vertexCount);
-                for (int i = 0; i < mesh.indices.Count; i += 3)
-                {
-                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
-                    Vector3 p0 = mesh.vertices[i0], p1 = mesh.vertices[i1], p2 = mesh.vertices[i2];
-                    float area = Vector3.Cross(p1-p0, p2-p0).magnitude / 2.0f;
-                    M.Add(i0, i0, area / 3.0f);
-                    M.Add(i1, i1, area / 3.0f);
-                    M.Add(i2, i2, area / 3.0f);
-                }
-                return M;
-            }
-        }
-
-        /// <summary>
-        /// A simple sparse matrix implementation using CSR format for use with Burst/Jobs.
-        /// </summary>
-        public class SparseMatrix : IDisposable
-        {
-            public NativeArray<float> values;
-            public NativeArray<int> indices; // column indices
-            public NativeArray<int> pointers; // row pointers
-            private Dictionary<int, float>[] rows;
-            private int n, m;
-
-            public SparseMatrix(int n_rows, int n_cols)
-            {
-                this.n = n_rows;
-                this.m = n_cols;
-                rows = new Dictionary<int, float>[n];
-                for(int i=0; i<n; i++) rows[i] = new Dictionary<int, float>();
-            }
-
-            public void Set(int r, int c, float val) { rows[r][c] = val; }
-            public void Add(int r, int c, float val) { rows[r][c] = Get(r,c) + val; }
-            public float Get(int r, int c) { return rows[r].TryGetValue(c, out float v) ? v : 0; }
-            public Dictionary<int, float> GetRow(int r) { return rows[r]; }
-
-            public void ToNativeArrays()
-            {
-                int nnz = rows.Sum(row => row.Count);
-                values = new NativeArray<float>(nnz, Allocator.TempJob);
-                indices = new NativeArray<int>(nnz, Allocator.TempJob);
-                pointers = new NativeArray<int>(n + 1, Allocator.TempJob);
-
-                int val_idx = 0;
-                for (int i = 0; i < n; i++)
-                {
-                    pointers[i] = val_idx;
-                    foreach (var pair in rows[i].OrderBy(p => p.Key))
-                    {
-                        values[val_idx] = pair.Value;
-                        indices[val_idx] = pair.Key;
-                        val_idx++;
-                    }
-                }
-                pointers[n] = val_idx;
-            }
-
-            public void Dispose()
-            {
-                if(values.IsCreated) values.Dispose();
-                if(indices.IsCreated) indices.Dispose();
-                if(pointers.IsCreated) pointers.Dispose();
-            }
             /// <summary>
             /// Identifies edges where the angle between adjacent face normals exceeds a given threshold.
             /// </summary>
@@ -1587,29 +1403,22 @@ namespace Empart.EmberPart
                 }
                 sdfValues = new NativeArray<float>(voxelCount, Allocator.Persistent);
 
-                if (settings.voxelMethod == ConvexDecompositionSettings.VoxelizationMethod.GPU_Accelerated)
+                // Depending on strategy
+                switch (settings.voxelizationStrategy)
                 {
-                    GpuVoxelizer.Voxelize(this, settings.enableSDF);
-                }
-                else
-                {
-                    // Depending on strategy
-                    switch (settings.voxelizationStrategy)
-                    {
-                        case VoxelizationStrategy.SolidFill:
-                            VoxelizeSolidFill();
-                            break;
-                        case VoxelizationStrategy.RaycastBased:
-                            VoxelizeRaycast();
-                            break;
-                        case VoxelizationStrategy.Adaptive:
-                            VoxelizeAdaptive(settings.voxelSize, settings.voxelAdaptivity);
-                            break;
-                        // Add other strategies...
-                        default:
-                            VoxelizeSolidFill();
-                            break;
-                    }
+                    case VoxelizationStrategy.SolidFill:
+                        VoxelizeSolidFill();
+                        break;
+                    case VoxelizationStrategy.RaycastBased:
+                        VoxelizeRaycast();
+                        break;
+                    case VoxelizationStrategy.Adaptive:
+                        VoxelizeAdaptive(settings.voxelSize, settings.voxelAdaptivity);
+                        break;
+                    // Add other strategies...
+                    default:
+                        VoxelizeSolidFill();
+                        break;
                 }
                 // Additional: Validate voxelization
                 ValidateVoxelization();
@@ -1718,16 +1527,22 @@ namespace Empart.EmberPart
             private Vector3 VoxelToWorld(int3 coord) => voxelBounds.min + new Vector3(coord.x, coord.y, coord.z) * (voxelBounds.size / new Vector3(voxelDimensions));
 
             /// <summary>
-            /// A simple point-in-mesh test using raycasting. Note: Not robust for points on the surface.
+            /// A robust, self-contained point-in-mesh test using raycasting against the mesh's own BVH.
+            /// This avoids any dependency on the Unity Physics engine.
             /// </summary>
+            /// <param name="point">The point to check.</param>
+            /// <returns>True if the point is inside the mesh, false otherwise.</returns>
             private bool IsPointInside(Vector3 point)
             {
-                int crossings = 0;
-                foreach (var dir in new Vector3[]{ Vector3.right, Vector3.up, Vector3.forward })
+                if (accelerationStructure == null)
                 {
-                    if (Physics.Raycast(point, dir, float.MaxValue)) crossings++;
+                    BuildAccelerationStructure();
                 }
-                return crossings > 1; // Majority vote
+
+                // A point is inside a closed mesh if a ray from the point in any direction
+                // intersects the mesh an odd number of times.
+                int intersections = accelerationStructure.IntersectRay(point, Vector3.right, float.MaxValue).Count;
+                return (intersections % 2) == 1;
             }
 
             /// <summary>
@@ -1747,40 +1562,34 @@ namespace Empart.EmberPart
             {
                 if (!settings.enableSDF || !sdfValues.IsCreated || sdfValues.Length == 0) return;
 
-                // The actual SDF generation is now part of the GpuVoxelizer pipeline if using GPU.
-                // If using CPU, we use the basic smoothing method.
-                if (settings.voxelMethod != ConvexDecompositionSettings.VoxelizationMethod.GPU_Accelerated)
+                // Use fast marching method or iterative smoothing for SDF
+                for (int iter = 0; iter < 5; iter++) // Hardcoded iterations for basic method
                 {
-                     // Use fast marching method or iterative smoothing for SDF
-                    for (int iter = 0; iter < 5; iter++) // Hardcoded iterations for basic method
+                    var newSDF = new NativeArray<float>(sdfValues, Allocator.Temp);
+                    for (int x = 1; x < voxelDimensions.x - 1; x++)
                     {
-                        var newSDF = new NativeArray<float>(sdfValues, Allocator.Temp);
-                        for (int x = 1; x < voxelDimensions.x - 1; x++)
+                        for (int y = 1; y < voxelDimensions.y - 1; y++)
                         {
-                            for (int y = 1; y < voxelDimensions.y - 1; y++)
+                            for (int z = 1; z < voxelDimensions.z - 1; z++)
                             {
-                                for (int z = 1; z < voxelDimensions.z - 1; z++)
+                                int idx = GetVoxelIndex(new int3(x, y, z));
+                                float sum = 0f;
+                                int count = 0;
+                                // Neighbor offsets
+                                int3[] offsets = { new int3(1, 0, 0), new int3(-1, 0, 0), new int3(0, 1, 0), new int3(0, -1, 0), new int3(0, 0, 1), new int3(0, 0, -1) };
+                                foreach (var off in offsets)
                                 {
-                                    int idx = GetVoxelIndex(new int3(x, y, z));
-                                    float sum = 0f;
-                                    int count = 0;
-                                    // Neighbor offsets
-                                    int3[] offsets = { new int3(1, 0, 0), new int3(-1, 0, 0), new int3(0, 1, 0), new int3(0, -1, 0), new int3(0, 0, 1), new int3(0, 0, -1) };
-                                    foreach (var off in offsets)
-                                    {
-                                        int nIdx = GetVoxelIndex(new int3(x, y, z) + off);
-                                        sum += sdfValues[nIdx];
-                                        count++;
-                                    }
-                                    newSDF[idx] = sdfValues[idx] * (1 - 0.1f) + (sum / count) * 0.1f;
+                                    int nIdx = GetVoxelIndex(new int3(x, y, z) + off);
+                                    sum += sdfValues[nIdx];
+                                    count++;
                                 }
+                                newSDF[idx] = sdfValues[idx] * (1 - 0.1f) + (sum / count) * 0.1f;
                             }
                         }
-                        sdfValues.CopyFrom(newSDF);
-                        newSDF.Dispose();
                     }
+                    sdfValues.CopyFrom(newSDF);
+                    newSDF.Dispose();
                 }
-                // For GPU method, SDF is computed in GpuVoxelizer.Voxelize
             }
             /// <summary>
             /// Decimate mesh to reduce vertex count
@@ -1817,6 +1626,193 @@ namespace Empart.EmberPart
                 {
                     genus = (2 - eulerCharacteristic) / 2;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Provides methods for computing geodesic distances and related properties on a mesh.
+        /// Uses the "Heat Method" for a fast and robust calculation.
+        /// </summary>
+        public static class Geodesic
+        {
+            // The heat method involves solving two linear systems. For a production Unity script
+            // without external libraries, we'll use an iterative solver (Jacobi method)
+            // which can be implemented with Burst and Jobs.
+
+            [BurstCompile]
+            private struct JacobiSolverJob : IJobParallelFor
+            {
+                [ReadOnly] public NativeArray<float> A_values; // Flattened Laplacian matrix
+                [ReadOnly] public NativeArray<int> A_indices;
+                [ReadOnly] public NativeArray<int> A_pointers;
+                [ReadOnly] public NativeArray<float> b; // Right-hand side vector
+                public NativeArray<float> x; // Solution vector (e.g., heat or distance)
+                [ReadOnly] public int iterations;
+
+                public void Execute(int index)
+                {
+                    for (int iter = 0; iter < iterations; iter++)
+                    {
+                        float sigma = 0;
+                        int row_start = A_pointers[index];
+                        int row_end = A_pointers[index + 1];
+
+                        for(int j = row_start; j < row_end; j++)
+                        {
+                            int col = A_indices[j];
+                            if(col != index)
+                            {
+                                sigma += A_values[j] * x[col];
+                            }
+                        }
+
+                        float a_ii = 0;
+                        for(int j = row_start; j < row_end; j++) { if(A_indices[j] == index) a_ii = A_values[j]; }
+
+                        if(Mathf.Abs(a_ii) > 1e-6)
+                        {
+                           x[index] = (b[index] - sigma) / a_ii;
+                        }
+                    }
+                }
+            }
+
+            public static List<float> CalculateHeat(MeshData mesh, int iterations)
+            {
+                int n = mesh.vertexCount;
+                var L = BuildCotanLaplacian(mesh);
+                var M = BuildMassMatrix(mesh);
+
+                var heat = new NativeArray<float>(n, Allocator.TempJob);
+                // Initial condition: heat source at a random vertex
+                heat[UnityEngine.Random.Range(0, n)] = 1.0f;
+
+                // Time-stepping (implicit Euler)
+                // (M - t*L)u_t = u_t-1
+                // This forms a linear system Ax = b where A = M - t*L, x = u_t, b = u_t-1
+                float t = Mathf.Pow(mesh.averageEdgeLength, 2);
+                var A = new SparseMatrix(n, n);
+                for(int i=0; i<n; i++)
+                {
+                    A.Set(i,i, M.Get(i,i) - t * L.Get(i,i));
+                    var neighbors = L.GetRow(i);
+                    foreach(var neighbor in neighbors)
+                    {
+                         A.Set(i, neighbor.Key, -t * neighbor.Value);
+                    }
+                }
+
+                var solver = new JacobiSolverJob
+                {
+                    A_values = A.values,
+                    A_indices = A.indices,
+                    A_pointers = A.pointers,
+                    b = heat,
+                    x = new NativeArray<float>(n, Allocator.TempJob),
+                    iterations = iterations
+                };
+                solver.Schedule(n, 64).Complete();
+
+                var result = new List<float>(solver.x.ToArray());
+
+                heat.Dispose();
+                solver.x.Dispose();
+                A.Dispose();
+                M.Dispose();
+                L.Dispose();
+
+                return result;
+            }
+
+            private static SparseMatrix BuildCotanLaplacian(MeshData mesh)
+            {
+                var L = new SparseMatrix(mesh.vertexCount, mesh.vertexCount);
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    Vector3 p0 = mesh.vertices[i0], p1 = mesh.vertices[i1], p2 = mesh.vertices[i2];
+
+                    float cot_alpha = Vector3.Dot(p1 - p0, p2 - p0) / Vector3.Cross(p1 - p0, p2 - p0).magnitude;
+                    float cot_beta = Vector3.Dot(p2 - p1, p0 - p1) / Vector3.Cross(p2 - p1, p0 - p1).magnitude;
+                    float cot_gamma = Vector3.Dot(p0 - p2, p1 - p2) / Vector3.Cross(p0 - p2, p1 - p2).magnitude;
+
+                    L.Add(i0, i1, -cot_gamma); L.Add(i1, i0, -cot_gamma);
+                    L.Add(i1, i2, -cot_alpha); L.Add(i2, i1, -cot_alpha);
+                    L.Add(i2, i0, -cot_beta); L.Add(i0, i2, -cot_beta);
+
+                    L.Add(i0, i0, cot_beta + cot_gamma);
+                    L.Add(i1, i1, cot_alpha + cot_gamma);
+                    L.Add(i2, i2, cot_alpha + cot_beta);
+                }
+                return L;
+            }
+
+            private static SparseMatrix BuildMassMatrix(MeshData mesh)
+            {
+                var M = new SparseMatrix(mesh.vertexCount, mesh.vertexCount);
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    int i0 = mesh.indices[i], i1 = mesh.indices[i+1], i2 = mesh.indices[i+2];
+                    Vector3 p0 = mesh.vertices[i0], p1 = mesh.vertices[i1], p2 = mesh.vertices[i2];
+                    float area = Vector3.Cross(p1-p0, p2-p0).magnitude / 2.0f;
+                    M.Add(i0, i0, area / 3.0f);
+                    M.Add(i1, i1, area / 3.0f);
+                    M.Add(i2, i2, area / 3.0f);
+                }
+                return M;
+            }
+        }
+
+        /// <summary>
+        /// A simple sparse matrix implementation using CSR format for use with Burst/Jobs.
+        /// </summary>
+        public class SparseMatrix : IDisposable
+        {
+            public NativeArray<float> values;
+            public NativeArray<int> indices; // column indices
+            public NativeArray<int> pointers; // row pointers
+            private Dictionary<int, float>[] rows;
+            private int n, m;
+
+            public SparseMatrix(int n_rows, int n_cols)
+            {
+                this.n = n_rows;
+                this.m = n_cols;
+                rows = new Dictionary<int, float>[n];
+                for(int i=0; i<n; i++) rows[i] = new Dictionary<int, float>();
+            }
+
+            public void Set(int r, int c, float val) { rows[r][c] = val; }
+            public void Add(int r, int c, float val) { rows[r][c] = Get(r,c) + val; }
+            public float Get(int r, int c) { return rows[r].TryGetValue(c, out float v) ? v : 0; }
+            public Dictionary<int, float> GetRow(int r) { return rows[r]; }
+
+            public void ToNativeArrays()
+            {
+                int nnz = rows.Sum(row => row.Count);
+                values = new NativeArray<float>(nnz, Allocator.TempJob);
+                indices = new NativeArray<int>(nnz, Allocator.TempJob);
+                pointers = new NativeArray<int>(n + 1, Allocator.TempJob);
+
+                int val_idx = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    pointers[i] = val_idx;
+                    foreach (var pair in rows[i].OrderBy(p => p.Key))
+                    {
+                        values[val_idx] = pair.Value;
+                        indices[val_idx] = pair.Key;
+                        val_idx++;
+                    }
+                }
+                pointers[n] = val_idx;
+            }
+
+            public void Dispose()
+            {
+                if(values.IsCreated) values.Dispose();
+                if(indices.IsCreated) indices.Dispose();
+                if(pointers.IsCreated) pointers.Dispose();
             }
         }
         /// <summary>
@@ -1889,6 +1885,12 @@ namespace Empart.EmberPart
             public List<HullMetrics> hullMetrics = new List<HullMetrics>();
             [Tooltip("A list of detailed metrics for each processing region.")]
             public List<RegionMetrics> regionMetrics = new List<RegionMetrics>();
+            [Tooltip("A list of all error values for creating a histogram.")]
+            public List<float> errorDistribution = new List<float>();
+            [Tooltip("Number of successful hull merges.")]
+            public int successfulMerges = 0;
+            [Tooltip("Ratio of successful merges to the initial number of hulls.")]
+            public float mergeEfficiency = 0f;
 
             // Internal data for calculations
             private float originalMeshVolume;
@@ -1950,6 +1952,9 @@ namespace Empart.EmberPart
             public float hausdorffError;
             public float compactness;
             public float sphericity;
+            public float aspectRatio;
+            public Bounds bounds;
+            public Vector3 centroid;
         }
         /// <summary>
         /// Represents a single convex hull, including its geometry, topological properties, and methods for analysis and optimization.
@@ -1991,6 +1996,20 @@ namespace Empart.EmberPart
 
             // Internal data
             private List<Vector3> witnessPoints; // Points on the original mesh used to calculate concavity
+            private List<float> witnessErrors;
+            private List<Vector3> symmetryAxes;
+            private Matrix4x4 inertiaMatrix;
+            private float inertiaTensor;
+            private float aspectRatio;
+            private float elongation;
+            private float flatness;
+            private int eulerCharacteristic;
+            private int genus;
+            private DateTime creationTime;
+            private MeshData meshData;
+            private BVH accelerationStructure;
+            private bool hasPrecomputedData = false;
+            private Dictionary<string, object> customProperties = new Dictionary<string, object>();
             /// <summary>
             /// Optimizes the hull's vertex count using the specified strategy, while attempting to stay within the error tolerance.
             /// </summary>
@@ -3053,7 +3072,7 @@ namespace Empart.EmberPart
                 }
 
                 // Re-hull with the combined original and reflected points to create a symmetric hull
-                var newHull = QuickHullImplementation.ComputeConvexHullFromPoints(symmetrizedPoints.Distinct().ToList());
+                var newHull = QuickHull3D.Compute(symmetrizedPoints.Distinct().ToList());
                 if (newHull.vertices.Count > 3)
                 {
                     this.vertices = newHull.vertices;
@@ -3658,6 +3677,13 @@ namespace Empart.EmberPart
                 if (hullMesh.vertices.Count == 0) return 0f;
                 return CalculateSymmetricHausdorff(mesh, hullMesh, maxSamples);
             }
+
+            public static float CalculateHausdorff(MeshData mesh, List<ConvexHull> hulls, int maxSamples = 2000)
+            {
+                var hullMesh = CombineHullsToMesh(hulls);
+                if (hullMesh.vertices.Count == 0) return 0f;
+                return CalculateHausdorff(mesh, hullMesh);
+            }
             public static List<float> CalculateErrorDistribution(MeshData mesh, List<ConvexHull> hulls, int sampleCount = 1000)
             {
                 var hullMesh = CombineHullsToMesh(hulls);
@@ -3976,303 +4002,572 @@ namespace Empart.EmberPart
             }
         }
         /// <summary>
-        /// Full 3D QuickHull implementation for convex hull generation.
-        /// Uses a half-edge data structure to manage hull topology.
+        /// A robust, from-scratch implementation of the QuickHull 3D algorithm for generating convex hulls.
+        /// This implementation uses a half-edge data structure to represent the hull's topology, allowing for
+        /// efficient and complex manipulations. It is designed to be robust against degenerate inputs and
+        /// includes post-processing steps like merging coplanar faces to produce clean, optimized hulls.
         /// </summary>
-        public static class QuickHullImplementation
+        public class QuickHull3D
         {
+            // Internal classes
+            #region Internal Classes
+            /// <summary>
+            /// Represents a vertex in the QuickHull algorithm, maintaining its position, index, and relationship to the hull's faces.
+            /// </summary>
             private class QHVertex
             {
+                /// <summary>The 3D position of the vertex.</summary>
                 public Vector3 position;
+                /// <summary>The original index of the vertex in the input list.</summary>
                 public int index;
-                public QHHalfEdge edge;
-                public bool onHull;
-            }
-            private class QHHalfEdge
-            {
-                public QHVertex vertex;
+                /// <summary>A pointer to the next vertex in a linked list, used for pooling and for the outside sets.</summary>
+                public QHVertex next;
+                /// <summary>The face to which this vertex has been assigned as part of its "outside" set. A vertex is outside a face if it is on the positive side of the face's plane.</summary>
                 public QHFace face;
-                public QHHalfEdge next;
-                public QHHalfEdge prev;
-                public QHHalfEdge twin;
             }
+
+            /// <summary>
+            /// Represents a triangular face of the convex hull.
+            /// </summary>
             private class QHFace
             {
-                public QHHalfEdge edge;
+                /// <summary>The three half-edges that form the boundary of this triangular face.</summary>
+                public QHHalfEdge[] edges = new QHHalfEdge[3];
+                /// <summary>The normal vector of the face, pointing outwards from the hull.</summary>
                 public Vector3 normal;
+                /// <summary>The distance from the origin to the plane of the face.</summary>
                 public float distance;
-                public List<QHVertex> outsideSet = new List<QHVertex>();
-                public bool visible;
-                public int generation;
+                /// <summary>The area of the triangular face.</summary>
+                public float area;
+                /// <summary>The geometric center of the face.</summary>
+                public Vector3 centroid;
+                /// <summary>A flag indicating if this face is visible from the current "eye" point during the hull construction.</summary>
+                public bool isVisible;
+                /// <summary>A linked list of vertices that are on the positive side of this face's plane.</summary>
+                public QHVertex outsideSet;
+                /// <summary>A pointer to the next face in a linked list, used for managing face collections.</summary>
+                public QHFace next;
+
+                /// <summary>
+                /// Gets the half-edge that is opposite to a given vertex on the face.
+                /// </summary>
+                /// <param name="v">The vertex for which to find the opposite edge.</param>
+                /// <returns>The half-edge opposite to the vertex.</returns>
+                public QHHalfEdge GetEdgeOpposite(QHVertex v)
+                {
+                    if (edges[0].tail == v) return edges[1];
+                    if (edges[1].tail == v) return edges[2];
+                    return edges[0];
+                }
+
+                /// <summary>Creates a new face from three vertices.</summary>
+                public static QHFace Create(QHVertex v0, QHVertex v1, QHVertex v2)
+                {
+                    var face = new QHFace();
+                    var e0 = new QHHalfEdge { tail = v0, head = v1, face = face };
+                    var e1 = new QHHalfEdge { tail = v1, head = v2, face = face };
+                    var e2 = new QHHalfEdge { tail = v2, head = v0, face = face };
+                    e0.next = e1; e1.prev = e0;
+                    e1.next = e2; e2.prev = e1;
+                    e2.next = e0; e0.prev = e2;
+                    face.edges[0] = e0; face.edges[1] = e1; face.edges[2] = e2;
+                    face.Recalculate();
+                    return face;
+                }
+
+                /// <summary>Recalculates the normal, distance, area, and centroid of the face.</summary>
+                public void Recalculate()
+                {
+                    var v0 = edges[0].tail.position;
+                    var v1 = edges[1].tail.position;
+                    var v2 = edges[2].tail.position;
+                    normal = Vector3.Cross(v1 - v0, v2 - v0).normalized;
+                    distance = Vector3.Dot(normal, v0);
+                    centroid = (v0 + v1 + v2) / 3.0f;
+                    area = 0.5f * Vector3.Cross(v1 - v0, v2 - v0).magnitude;
+                }
             }
-            public static ConvexHull ComputeConvexHullFromPoints(List<Vector3> points)
+
+            /// <summary>
+            /// Represents a directed edge (half-edge) in the hull's topological data structure. Each edge is part of a face's boundary loop.
+            /// </summary>
+            private class QHHalfEdge
+            {
+                /// <summary>The vertex at the tail (origin) of this half-edge.</summary>
+                public QHVertex tail;
+                /// <summary>The vertex at the head (end) of this half-edge.</summary>
+                public QHVertex head;
+                /// <summary>The face to which this half-edge belongs.</summary>
+                public QHFace face;
+                /// <summary>The next half-edge in the counter-clockwise loop around the face.</summary>
+                public QHHalfEdge next;
+                /// <summary>The previous half-edge in the counter-clockwise loop around the face.</summary>
+                public QHHalfEdge prev;
+                /// <summary>The corresponding half-edge in the adjacent face, running in the opposite direction.</summary>
+                public QHHalfEdge twin;
+            }
+
+            /// <summary>
+            /// A memory management utility to reuse QHVertex objects, reducing garbage collection overhead.
+            /// </summary>
+            private class VertexPool
+            {
+                private QHVertex head;
+                /// <summary>Retrieves a vertex from the pool or creates a new one if the pool is empty.</summary>
+                public QHVertex Get()
+                {
+                    if (head == null) return new QHVertex();
+                    var v = head;
+                    head = v.next;
+                    v.next = null;
+                    return v;
+                }
+                /// <summary>Returns a vertex to the pool for later reuse.</summary>
+                public void Return(QHVertex v)
+                {
+                    v.next = head;
+                    head = v;
+                }
+            }
+            #endregion
+
+            // Fields
+            #region Fields
+            /// <summary>The tolerance used for floating point comparisons to handle precision issues.</summary>
+            private readonly float epsilon;
+            /// <summary>If true, the algorithm will perform a post-processing step to merge adjacent faces that are nearly coplanar.</summary>
+            private readonly bool mergeCoplanarFaces;
+            /// <summary>The angle tolerance (in degrees) used when checking if faces are coplanar enough to be merged.</summary>
+            private readonly float mergeTolerance;
+            /// <summary>The list of vertices that are being processed to form the hull.</summary>
+            private List<QHVertex> vertices;
+            /// <summary>The list of faces that currently form the convex hull.</summary>
+            private List<QHFace> faces;
+            /// <summary>A pool for reusing QHVertex instances to reduce memory allocations.</summary>
+            private VertexPool vertexPool;
+            /// <summary>A temporary list used to gather vertices from the outside sets of faces that are about to be deleted.</summary>
+            private List<QHVertex> outsideSet;
+            /// <summary>A temporary list to hold newly created faces during a construction step.</summary>
+            private List<QHFace> newFaces;
+            #endregion
+
+            /// <summary>
+            /// Initializes a new instance of the QuickHull3D class with default settings.
+            /// </summary>
+            public QuickHull3D() : this(1e-5f, true, 1f) { }
+
+            /// <summary>
+            /// Initializes a new instance of the QuickHull3D class with custom settings.
+            /// </summary>
+            /// <param name="epsilon">The tolerance for floating point comparisons.</param>
+            /// <param name="mergeFaces">Whether to merge coplanar faces post-hull generation.</param>
+            /// <param name="mergeTolerance">The angle tolerance for merging faces.</param>
+            public QuickHull3D(float epsilon, bool mergeFaces, float mergeTolerance)
+            {
+                this.epsilon = epsilon;
+                this.mergeCoplanarFaces = mergeFaces;
+                this.mergeTolerance = mergeTolerance;
+            }
+
+            /// <summary>
+            /// A static method to generate a convex hull for a given set of points.
+            /// This provides a convenient entry point without needing to instantiate the class.
+            /// </summary>
+            public static ConvexHull Compute(List<Vector3> points)
+            {
+                return new QuickHull3D().Generate(points);
+            }
+
+            /// <summary>
+            /// Generates the convex hull for a given list of points.
+            /// </summary>
+            /// <param name="points">The list of points to hull.</param>
+            /// <returns>A ConvexHull object representing the result.</returns>
+            public ConvexHull Generate(List<Vector3> points)
             {
                 if (points == null || points.Count < 4)
                 {
+                    if(enableDetailedLoggingStatic) Debug.LogWarning("QuickHull requires at least 4 points.");
                     return new ConvexHull();
                 }
-                const float epsilon = 1e-5f;
-                List<QHFace> allFaces = new List<QHFace>();
-                List<QHVertex> qhVertices = points.Select((p, i) => new QHVertex { position = p, index = i }).ToList();
-                if (!CreateInitialSimplex(qhVertices, allFaces, epsilon))
+
+                Initialize(points);
+
+                if (!BuildInitialSimplex())
                 {
+                    if(enableDetailedLoggingStatic) Debug.LogWarning("Failed to build initial simplex. Input points may be degenerate (collinear or coplanar).");
                     return new ConvexHull();
                 }
-                int currentGeneration = 0;
-                while (true)
+
+                BuildHull();
+
+                if (mergeCoplanarFaces)
                 {
-                    QHFace furthestFace = null;
-                    QHVertex eyePoint = null;
-                    float maxDist = epsilon;
-                    foreach (var face in allFaces)
-                    {
-                        if (face.visible || face.outsideSet.Count == 0) continue;
-                        foreach (var v in face.outsideSet)
-                        {
-                            float dist = Vector3.Dot(face.normal, v.position) - face.distance;
-                            if (dist > maxDist)
-                            {
-                                maxDist = dist;
-                                furthestFace = face;
-                                eyePoint = v;
-                            }
-                        }
-                    }
-                    if (furthestFace == null || eyePoint == null) break;
-                    eyePoint.onHull = true;
-                    List<QHFace> visibleFaces = new List<QHFace>();
-                    List<QHHalfEdge> horizonEdges = new List<QHHalfEdge>();
-                    Stack<QHFace> faceStack = new Stack<QHFace>();
-                    furthestFace.visible = true;
-                    faceStack.Push(furthestFace);
-                    while (faceStack.Count > 0)
-                    {
-                        var face = faceStack.Pop();
-                        visibleFaces.Add(face);
-                        var edge = face.edge;
-                        do
-                        {
-                            var neighbor = edge.twin.face;
-                            if (!neighbor.visible)
-                            {
-                                float dist = Vector3.Dot(neighbor.normal, eyePoint.position) - neighbor.distance;
-                                if (dist > epsilon)
-                                {
-                                    neighbor.visible = true;
-                                    faceStack.Push(neighbor);
-                                }
-                                else
-                                {
-                                    horizonEdges.Add(edge);
-                                }
-                            }
-                            edge = edge.next;
-                        } while (edge != face.edge);
-                    }
-                    List<QHVertex> orphanedPoints = new List<QHVertex>();
-                    foreach (var face in visibleFaces)
-                    {
-                        orphanedPoints.AddRange(face.outsideSet);
-                        face.outsideSet.Clear();
-                    }
-                    // after collecting raw horizonEdges:
-                    var horizon = OrderHorizonEdges(horizonEdges);
-                    var newFaces = new List<QHFace>();
-                    BuildFacesFromHorizon(horizon, eyePoint, newFaces);
-                    // Assign orphaned points to new faces
-                    foreach (var v in orphanedPoints)
-                    {
-                        if (v.onHull) continue;
-                        QHFace bestFace = null;
-                        float maxPointDist = epsilon;
-                        foreach (var face in newFaces)
-                        {
-                            float dist = Vector3.Dot(face.normal, v.position) - face.distance;
-                            if (dist > maxPointDist)
-                            {
-                                maxPointDist = dist;
-                                bestFace = face;
-                            }
-                        }
-                        if (bestFace != null)
-                        {
-                            bestFace.outsideSet.Add(v);
-                        }
-                    }
-                    allFaces.AddRange(newFaces);
-                    currentGeneration++;
+                    MergeCoplanarFaces();
                 }
-                var finalHull = new ConvexHull();
-                var vertexMap = new Dictionary<QHVertex, int>();
-                allFaces.RemoveAll(f => f.visible);
-                foreach (var face in allFaces)
-                {
-                    var edge = face.edge;
-                    do
-                    {
-                        if (!vertexMap.ContainsKey(edge.vertex))
-                        {
-                            vertexMap.Add(edge.vertex, finalHull.vertices.Count);
-                            finalHull.vertices.Add(edge.vertex.position);
-                        }
-                        edge = edge.next;
-                    } while (edge != face.edge);
-                }
-                foreach (var face in allFaces)
-                {
-                    finalHull.indices.Add(vertexMap[face.edge.vertex]);
-                    finalHull.indices.Add(vertexMap[face.edge.next.vertex]);
-                    finalHull.indices.Add(vertexMap[face.edge.next.next.vertex]);
-                }
-                finalHull.CalculateProperties();
-                return finalHull;
+
+                return CreateFinalHull();
             }
-            // Order the horizon into a loop: next starts at current.twin.vertex
-            static List<QHHalfEdge> OrderHorizonEdges(List<QHHalfEdge> raw)
+
+            /// <summary>Initializes the internal data structures for the algorithm.</summary>
+            private void Initialize(List<Vector3> points)
             {
-                var from = new Dictionary<QHVertex, QHHalfEdge>();
-                foreach (var e in raw) from[e.vertex] = e; // e.vertex is the tail (origin) of the horizon edge on a VISIBLE face
-                var ordered = new List<QHHalfEdge>(raw.Count);
-                var cur = raw[0];
-                ordered.Add(cur);
-                while (ordered.Count < raw.Count)
+                vertexPool = new VertexPool();
+                vertices = new List<QHVertex>(points.Count);
+                for (int i = 0; i < points.Count; i++)
                 {
-                    if (!from.TryGetValue(cur.twin.vertex, out var next)) break; // next tail == current head
-                    ordered.Add(next);
-                    cur = next;
+                    var v = vertexPool.Get();
+                    v.position = points[i];
+                    v.index = i;
+                    vertices.Add(v);
                 }
-                return ordered;
+                faces = new List<QHFace>();
+                newFaces = new List<QHFace>();
+                outsideSet = new List<QHVertex>();
             }
-            // Build the "cone" of new faces around 'eye' from the ordered horizon
-            static void BuildFacesFromHorizon(List<QHHalfEdge> orderedHorizon, QHVertex eye, List<QHFace> newFaces)
+
+            /// <summary>Builds the initial tetrahedron (simplex) from the input points.</summary>
+            private bool BuildInitialSimplex()
             {
-                QHHalfEdge firstB = null;
-                QHHalfEdge prevC = null;
-                foreach (var h in orderedHorizon)
-                {
-                    var vA = h.vertex; // tail of horizon edge on visible side
-                    var vB = h.twin.vertex; // head of horizon edge (in the neighbor, i.e., outside)
-                    var f = new QHFace();
-                    var a = new QHHalfEdge { vertex = vA, face = f }; // vA -> vB (shares with old outside face)
-                    var b = new QHHalfEdge { vertex = vB, face = f }; // vB -> eye (will twin with previous face's c)
-                    var c = new QHHalfEdge { vertex = eye, face = f }; // eye -> vA (will twin with next face's b)
-                    // cycle
-                    a.next = b; b.next = c; c.next = a;
-                    a.prev = c; b.prev = a; c.prev = b;
-                    // twin to the existing outside face along the horizon
-                    a.twin = h.twin;
-                    h.twin.twin = a;
-                    // stitch around the eye
-                    if (prevC != null) { prevC.twin = b; b.twin = prevC; } else { firstB = b; }
-                    // face data
-                    f.edge = a;
-                    f.normal = Vector3.Cross(vB.position - vA.position, eye.position - vA.position).normalized;
-                    f.distance = Vector3.Dot(f.normal, vA.position);
-                    newFaces.Add(f);
-                    prevC = c;
-                }
-                // close the ring
-                if (firstB != null && prevC != null) { firstB.twin = prevC; prevC.twin = firstB; }
-            }
-            private static bool CreateInitialSimplex(List<QHVertex> vertices, List<QHFace> faces, float epsilon)
-            {
-                faces.Clear();
-                int i0 = 0, i1 = 0;
+                // Find the two most distant points to form the first edge.
                 float maxDistSq = 0;
+                QHVertex v0 = null, v1 = null;
                 for (int i = 0; i < vertices.Count; i++)
+                {
                     for (int j = i + 1; j < vertices.Count; j++)
                     {
                         float d = (vertices[j].position - vertices[i].position).sqrMagnitude;
-                        if (d > maxDistSq) { maxDistSq = d; i0 = i; i1 = j; }
-                    }
-                if (Mathf.Sqrt(maxDistSq) < epsilon) return false;
-                int i2 = -1;
-                maxDistSq = 0;
-                for (int i = 0; i < vertices.Count; i++)
-                {
-                    if (i == i0 || i == i1) continue;
-                    float d = DistanceToLineSq(vertices[i].position, vertices[i0].position, vertices[i1].position);
-                    if (d > maxDistSq) { maxDistSq = d; i2 = i; }
-                }
-                if (i2 == -1 || Mathf.Sqrt(maxDistSq) < epsilon) return false;
-                int i3 = -1;
-                float maxDist = 0;
-                for (int i = 0; i < vertices.Count; i++)
-                {
-                    if (i == i0 || i == i1 || i == i2) continue;
-                    float d = DistanceToPlane(vertices[i].position, vertices[i0].position, vertices[i1].position, vertices[i2].position);
-                    if (Mathf.Abs(d) > maxDist) { maxDist = Mathf.Abs(d); i3 = i; }
-                }
-                if (i3 == -1 || maxDist < epsilon) return false;
-                var v = new QHVertex[4] { vertices[i0], vertices[i1], vertices[i2], vertices[i3] };
-                if (DistanceToPlane(v[3].position, v[0].position, v[1].position, v[2].position) > 0)
-                {
-                    (v[1], v[2]) = (v[2], v[1]);
-                }
-                for (int i = 0; i < 4; i++) v[i].onHull = true;
-                faces.Add(CreateFace(v[0], v[1], v[2]));
-                faces.Add(CreateFace(v[3], v[1], v[0]));
-                faces.Add(CreateFace(v[3], v[2], v[1]));
-                faces.Add(CreateFace(v[3], v[0], v[2]));
-                LinkTwins(faces[0].edge, faces[1].edge.next);
-                LinkTwins(faces[0].edge.next, faces[2].edge.next);
-                LinkTwins(faces[0].edge.prev, faces[3].edge.next);
-                LinkTwins(faces[1].edge, faces[2].edge.prev);
-                LinkTwins(faces[1].edge.prev, faces[3].edge);
-                LinkTwins(faces[2].edge, faces[3].edge.prev);
-                foreach (var vert in vertices)
-                {
-                    if (vert.onHull) continue;
-                    QHFace bestFace = null;
-                    float maxPointDist = epsilon;
-                    foreach (var face in faces)
-                    {
-                        float dist = Vector3.Dot(face.normal, vert.position) - face.distance;
-                        if (dist > maxPointDist)
+                        if (d > maxDistSq)
                         {
-                            maxPointDist = dist;
-                            bestFace = face;
+                            maxDistSq = d;
+                            v0 = vertices[i];
+                            v1 = vertices[j];
                         }
                     }
-                    if (bestFace != null) bestFace.outsideSet.Add(vert);
+                }
+                if (v0 == null || Mathf.Sqrt(maxDistSq) < epsilon) return false;
+
+                // Find the point furthest from the line (v0, v1).
+                maxDistSq = 0;
+                QHVertex v2 = null;
+                for (int i = 0; i < vertices.Count; i++)
+                {
+                    if (vertices[i] == v0 || vertices[i] == v1) continue;
+                    float d = Vector3.Cross(vertices[i].position - v0.position, v1.position - v0.position).sqrMagnitude;
+                    if (d > maxDistSq)
+                    {
+                        maxDistSq = d;
+                        v2 = vertices[i];
+                    }
+                }
+                if (v2 == null || Mathf.Sqrt(maxDistSq) < epsilon) return false;
+
+                // Find the point furthest from the plane defined by (v0, v1, v2).
+                maxDistSq = 0;
+                QHVertex v3 = null;
+                var planeNormal = Vector3.Cross(v1.position - v0.position, v2.position - v0.position);
+                for (int i = 0; i < vertices.Count; i++)
+                {
+                    if (vertices[i] == v0 || vertices[i] == v1 || vertices[i] == v2) continue;
+                    float d = Mathf.Abs(Vector3.Dot(vertices[i].position - v0.position, planeNormal));
+                    if (d > maxDistSq)
+                    {
+                        maxDistSq = d;
+                        v3 = vertices[i];
+                    }
+                }
+                if (v3 == null || maxDistSq < epsilon * epsilon * planeNormal.sqrMagnitude) return false;
+
+                // Ensure the simplex has a non-zero volume and correct orientation.
+                if (Vector3.Dot(v3.position - v0.position, planeNormal) > 0)
+                {
+                    (v1, v2) = (v2, v1);
+                }
+
+                // Create the four faces of the tetrahedron.
+                var f0 = QHFace.Create(v0, v1, v2);
+                var f1 = QHFace.Create(v0, v2, v3);
+                var f2 = QHFace.Create(v0, v3, v1);
+                var f3 = QHFace.Create(v1, v3, v2);
+                faces.AddRange(new[] { f0, f1, f2, f3 });
+
+                // Link the half-edges of the faces.
+                Link(f0.GetEdgeOpposite(v0), f3.GetEdgeOpposite(v3));
+                Link(f0.GetEdgeOpposite(v1), f2.GetEdgeOpposite(v3));
+                Link(f0.GetEdgeOpposite(v2), f1.GetEdgeOpposite(v3));
+                Link(f1.GetEdgeOpposite(v0), f2.GetEdgeOpposite(v1));
+                Link(f1.GetEdgeOpposite(v2), f3.GetEdgeOpposite(v1));
+                Link(f2.GetEdgeOpposite(v0), f3.GetEdgeOpposite(v2));
+
+                // Assign all other points to the outside set of the face they are furthest from.
+                foreach (var v in vertices)
+                {
+                    if (v == v0 || v == v1 || v == v2 || v == v3) continue;
+                    AssignPointToFace(v);
                 }
                 return true;
             }
-            private static float DistanceToLineSq(Vector3 p, Vector3 a, Vector3 b)
+
+            /// <summary>Contains the main loop of the QuickHull algorithm.</summary>
+            private void BuildHull()
             {
-                Vector3 ab = b - a;
-                Vector3 ap = p - a;
-                return Vector3.Cross(ab, ap).sqrMagnitude / ab.sqrMagnitude;
+                while (true)
+                {
+                    QHVertex eye = FindEyePoint();
+                    if (eye == null) break;
+
+                    BuildHorizon(eye);
+                    AddCone(eye);
+
+                    // Reassign points that were in the outside sets of the deleted visible faces.
+                    foreach (var point in outsideSet)
+                    {
+                        AssignPointToFace(point);
+                    }
+                    outsideSet.Clear();
+                }
             }
-            private static float DistanceToPlane(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
+
+            /// <summary>Finds the point furthest from any face, which will be the "eye" point for the next iteration.</summary>
+            private QHVertex FindEyePoint()
             {
-                Vector3 normal = Vector3.Cross(b - a, c - a).normalized;
-                return Vector3.Dot(normal, p - a);
+                float maxDist = epsilon;
+                QHVertex eye = null;
+                foreach (var face in faces)
+                {
+                    if (face.outsideSet != null)
+                    {
+                        float dist = Vector3.Dot(face.outsideSet.position, face.normal) - face.distance;
+                        if (dist > maxDist)
+                        {
+                            maxDist = dist;
+                            eye = face.outsideSet;
+                        }
+                    }
+                }
+                return eye;
             }
-            private static QHFace CreateFace(QHVertex a, QHVertex b, QHVertex c)
+
+            /// <summary>Builds the horizon of edges that separates the visible from the non-visible faces.</summary>
+            private void BuildHorizon(QHVertex eye)
             {
-                var face = new QHFace();
-                var e0 = new QHHalfEdge { vertex = a, face = face };
-                var e1 = new QHHalfEdge { vertex = b, face = face };
-                var e2 = new QHHalfEdge { vertex = c, face = face };
-                e0.next = e1; e1.prev = e0;
-                e1.next = e2; e2.prev = e1;
-                e2.next = e0; e0.prev = e2;
-                face.edge = e0;
-                face.normal = Vector3.Cross(b.position - a.position, c.position - a.position).normalized;
-                face.distance = Vector3.Dot(face.normal, a.position);
-                return face;
+                outsideSet.Clear();
+                var visibleFaces = new List<QHFace>();
+
+                // Use a stack for a flood-fill search to find all visible faces.
+                var stack = new Stack<QHFace>();
+                eye.face.isVisible = true;
+                stack.Push(eye.face);
+
+                while (stack.Count > 0)
+                {
+                    var face = stack.Pop();
+                    visibleFaces.Add(face);
+
+                    var edge = face.edges[0];
+                    do
+                    {
+                        var neighbor = edge.twin.face;
+                        if (!neighbor.isVisible)
+                        {
+                            float dist = Vector3.Dot(eye.position, neighbor.normal) - neighbor.distance;
+                            if (dist > epsilon)
+                            {
+                                neighbor.isVisible = true;
+                                stack.Push(neighbor);
+                            }
+                        }
+                        edge = edge.next;
+                    } while (edge != face.edges[0]);
+                }
+
+                // Collect orphaned points from the visible faces that will be deleted.
+                foreach (var face in visibleFaces)
+                {
+                    var v = face.outsideSet;
+                    while (v != null)
+                    {
+                        outsideSet.Add(v);
+                        v = v.next;
+                    }
+                }
+                faces.RemoveAll(f => f.isVisible);
             }
-            private static void LinkTwins(QHHalfEdge e1, QHHalfEdge e2)
+
+            /// <summary>Creates a "cone" of new faces from the horizon edges to the eye point.</summary>
+            private void AddCone(QHVertex eye)
+            {
+                newFaces.Clear();
+                var horizon = FindHorizon();
+
+                QHHalfEdge firstEdge = null, lastEdge = null;
+
+                foreach (var horizonEdge in horizon)
+                {
+                    var newFace = QHFace.Create(horizonEdge.tail, horizonEdge.head, eye);
+                    newFaces.Add(newFace);
+
+                    // Link the new face to the horizon edge.
+                    Link(horizonEdge, newFace.GetEdgeOpposite(eye));
+
+                    if (lastEdge != null)
+                    {
+                        Link(lastEdge, newFace.edges[1]);
+                    }
+                    else
+                    {
+                        firstEdge = newFace.edges[0];
+                    }
+                    lastEdge = newFace.edges[2];
+                }
+                Link(lastEdge, firstEdge);
+                faces.AddRange(newFaces);
+            }
+
+            /// <summary>Finds the connected loop of horizon edges.</summary>
+            private List<QHHalfEdge> FindHorizon()
+            {
+                var horizon = new List<QHHalfEdge>();
+                foreach (var face in faces)
+                {
+                    var edge = face.edges[0];
+                    do
+                    {
+                        if (edge.twin.face.isVisible)
+                        {
+                            horizon.Add(edge);
+                        }
+                        edge = edge.next;
+                    } while (edge != face.edges[0]);
+                }
+                return horizon;
+            }
+
+            /// <summary>Assigns a point to the outside set of the face it is furthest from.</summary>
+            private void AssignPointToFace(QHVertex point)
+            {
+                QHFace bestFace = null;
+                float maxDist = epsilon;
+                foreach (var face in faces)
+                {
+                    float dist = Vector3.Dot(point.position, face.normal) - face.distance;
+                    if (dist > maxDist)
+                    {
+                        maxDist = dist;
+                        bestFace = face;
+                    }
+                }
+                if (bestFace != null)
+                {
+                    point.next = bestFace.outsideSet;
+                    bestFace.outsideSet = point;
+                    point.face = bestFace;
+                }
+                else
+                {
+                    // Point is inside the hull, return it to the pool.
+                    vertexPool.Return(point);
+                }
+            }
+
+            /// <summary>Merges adjacent faces that are nearly coplanar.</summary>
+            private void MergeCoplanarFaces()
+            {
+                 bool changed = true;
+                while(changed)
+                {
+                    changed = false;
+                    for (int i = 0; i < faces.Count; i++)
+                    {
+                        var face = faces[i];
+                        for (int j = 0; j < 3; j++)
+                        {
+                            var edge = face.edges[j];
+                            var twinFace = edge.twin.face;
+
+                            // Check if the angle between face normals is within tolerance.
+                            if (Vector3.Dot(face.normal, twinFace.normal) > Mathf.Cos(mergeTolerance * Mathf.Deg2Rad))
+                            {
+                                // Merge twinFace into face.
+                                Merge(face, twinFace);
+                                faces.Remove(twinFace);
+                                changed = true;
+                                goto next_iteration;
+                            }
+                        }
+                    }
+                    next_iteration:;
+                }
+            }
+
+            /// <summary>Performs the merge operation between two faces.</summary>
+            private void Merge(QHFace face, QHFace twinFace)
+            {
+                // Re-assign outside points from the merged face.
+                var v = twinFace.outsideSet;
+                while (v != null)
+                {
+                    AssignPointToFace(v);
+                    v = v.next;
+                }
+
+                // Find the two edges on the horizon of the merge.
+                var e0 = face.edges.First(e => e.twin.face == twinFace);
+                var e1 = e0.twin;
+
+                e0.prev.next = e1.next;
+                e1.next.prev = e0.prev;
+                e1.prev.next = e0.next;
+                e0.next.prev = e1.prev;
+
+                // Re-link the edges around the new merged face.
+                var edge = e0.next;
+                while (edge.face == e1.face)
+                {
+                    edge.face = e0.face;
+                    edge = edge.next;
+                }
+
+                // Recalculate face properties.
+                face.Recalculate();
+            }
+
+            /// <summary>Creates the final ConvexHull object from the internal data structures.</summary>
+            private ConvexHull CreateFinalHull()
+            {
+                var finalHull = new ConvexHull();
+                var vertexMap = new Dictionary<QHVertex, int>();
+
+                foreach (var face in faces)
+                {
+                    var edge = face.edges[0];
+                    do
+                    {
+                        if (!vertexMap.ContainsKey(edge.tail))
+                        {
+                            vertexMap.Add(edge.tail, finalHull.vertices.Count);
+                            finalHull.vertices.Add(edge.tail.position);
+                        }
+                        edge = edge.next;
+                    } while (edge != face.edges[0]);
+                }
+
+                foreach (var face in faces)
+                {
+                    finalHull.indices.Add(vertexMap[face.edges[0].tail]);
+                    finalHull.indices.Add(vertexMap[face.edges[1].tail]);
+                    finalHull.indices.Add(vertexMap[face.edges[2].tail]);
+                }
+
+                finalHull.CalculateProperties();
+                return finalHull;
+            }
+
+            /// <summary>Links two half-edges as twins.</summary>
+            private static void Link(QHHalfEdge e1, QHHalfEdge e2)
             {
                 e1.twin = e2;
                 e2.twin = e1;
-            }
-            // Additional: Simplify hull
-            public static ConvexHull Simplify(ConvexHull hull, ConvexDecompositionSettings settings, float tolerance)
-            {
-                hull.OptimizeHull(settings, tolerance);
-                return hull;
             }
         }
         /// <summary>
@@ -4324,7 +4619,7 @@ namespace Empart.EmberPart
             {
                 var allPoints = new List<Vector3>(hull1.vertices);
                 allPoints.AddRange(hull2.vertices);
-                var union = QuickHullImplementation.ComputeConvexHullFromPoints(allPoints);
+                var union = QuickHull3D.Compute(allPoints);
                 // Additional: Optimize union
                 union.OptimizeHull(settings, 0.001f);
                 return union;
@@ -4386,7 +4681,7 @@ namespace Empart.EmberPart
                     }
                 }
                 outMesh.CalculateProperties();
-                var intersection = QuickHullImplementation.ComputeConvexHullFromPoints(outMesh.vertices);
+                var intersection = QuickHull3D.Compute(outMesh.vertices);
                 // Additional: Validate intersection
                 intersection.ValidateHull();
                 return intersection;
@@ -4409,7 +4704,7 @@ namespace Empart.EmberPart
                 foreach (var plane in planes)
                 {
                     // Split the mesh by the plane, keeping the "outside" part
-                    MeshSplitter.Split(outsideMesh, new PlaneF {n = -plane.n, d = -plane.d}, out var _, out outsideMesh);
+                    MeshCutter.Cut(outsideMesh, new PlaneF {n = -plane.n, d = -plane.d}, out var _, out outsideMesh);
                 }
 
                 outsideMesh.CalculateProperties();
@@ -4432,8 +4727,8 @@ namespace Empart.EmberPart
             // Additional: Boolean Union for meshes
             public static MeshData BooleanUnion(MeshData a, MeshData b)
             {
-                var hullA = QuickHullImplementation.ComputeConvexHullFromPoints(a.vertices);
-                var hullB = QuickHullImplementation.ComputeConvexHullFromPoints(b.vertices);
+                var hullA = QuickHull3D.Compute(a.vertices);
+                var hullB = QuickHull3D.Compute(b.vertices);
                 var unionHull = BooleanUnion(hullA, hullB);
                 var unionMesh = new MeshData { vertices = unionHull.vertices, indices = unionHull.indices };
                 return unionMesh;
@@ -4848,321 +5143,6 @@ namespace Empart.EmberPart
             }
         }
 
-        public static class GpuVoxelizer
-        {
-            private const string VoxelizerShaderSource = @"
-#pragma kernel Clear
-#pragma kernel VoxelizeSurface
-#pragma kernel Solidify
-#pragma kernel JFA_Seed
-#pragma kernel JFA_Pass
-#pragma kernel FinalizeSDF
-// Buffers
-RWStructuredBuffer<float> g_Voxels; // Will store the final SDF
-RWStructuredBuffer<int3> g_JFAGrid; // Stores the xyz coordinate of the closest seed
-StructuredBuffer<float3> g_Vertices;
-StructuredBuffer<int3> g_Indices;
-// Uniforms
-int g_TriangleCount;
-int3 g_VoxelDimensions;
-float3 g_VoxelBoundsMin;
-float3 g_VoxelBoundsSize;
-int g_JfaStep;
-// ==================================================================================
-// Separating Axis Theorem (SAT) for Triangle-AABB Intersection
-// ==================================================================================
-bool test_axis(float3 axis, float3 v0, float3 v1, float3 v2, float3 box_half_size)
-{
-    float p0 = dot(axis, v0);
-    float p1 = dot(axis, v1);
-    float p2 = dot(axis, v2);
-    float r = box_half_size.x * abs(axis.x) + box_half_size.y * abs(axis.y) + box_half_size.z * abs(axis.z);
-    float min_p = min(p0, min(p1, p2));
-    float max_p = max(p0, max(p1, p2));
-    return max_p >= -r && min_p <= r;
-}
-bool TriangleAABBOverlap(float3 v0, float3 v1, float3 v2, float3 box_center, float3 box_half_size)
-{
-    v0 -= box_center;
-    v1 -= box_center;
-    v2 -= box_center;
-    float3 f0 = v1 - v0;
-    float3 f1 = v2 - v1;
-    float3 f2 = v0 - v2;
-    if (!test_axis(float3(1, 0, 0), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(float3(0, 1, 0), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(float3(0, 0, 1), v0, v1, v2, box_half_size)) return false;
-    float3 tri_normal = cross(f0, f1);
-    if (!test_axis(tri_normal, v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(1, 0, 0), f0), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(1, 0, 0), f1), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(1, 0, 0), f2), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 1, 0), f0), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 1, 0), f1), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 1, 0), f2), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 0, 1), f0), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 0, 1), f1), v0, v1, v2, box_half_size)) return false;
-    if (!test_axis(cross(float3(0, 0, 1), f2), v0, v1, v2, box_half_size)) return false;
-    return true;
-}
-// ==================================================================================
-[numthreads(8,8,8)]
-void Clear (uint3 id : SV_DispatchThreadID)
-{
-    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-    if (index < g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z)
-    {
-        g_Voxels[index] = 1.0;
-    }
-}
-[numthreads(64,1,1)]
-void VoxelizeSurface (uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= g_TriangleCount) return;
-    int3 tri = g_Indices[id.x];
-    float3 v0 = g_Vertices[tri.x];
-    float3 v1 = g_Vertices[tri.y];
-    float3 v2 = g_Vertices[tri.z];
-    float3 minP = min(v0, min(v1, v2));
-    float3 maxP = max(v0, max(v1, v2));
-    float3 voxel_size = g_VoxelBoundsSize / g_VoxelDimensions;
-    int3 minCoord = max(int3(0,0,0), (int3)floor((minP - g_VoxelBoundsMin) / voxel_size));
-    int3 maxCoord = min(g_VoxelDimensions - 1, (int3)ceil((maxP - g_VoxelBoundsMin) / voxel_size));
-    for (int z = minCoord.z; z <= maxCoord.z; z++)
-    {
-        for (int y = minCoord.y; y <= maxCoord.y; y++)
-        {
-            for (int x = minCoord.x; x <= maxCoord.x; x++)
-            {
-                float3 voxelCenter = g_VoxelBoundsMin + (float3(x,y,z) + 0.5) * voxel_size;
-                float3 voxelHalfSize = voxel_size * 0.5;
-                if (TriangleAABBOverlap(v0, v1, v2, voxelCenter, voxelHalfSize))
-                {
-                    uint index = x + y * g_VoxelDimensions.x + z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-                    g_Voxels[index] = -1.0;
-                }
-            }
-        }
-    }
-}
-[numthreads(8,8,1)]
-void Solidify (uint3 id : SV_DispatchThreadID)
-{
-    uint x = id.x;
-    uint y = id.y;
-    if (x >= g_VoxelDimensions.x || y >= g_VoxelDimensions.y) return;
-    bool inside = false;
-    for (uint z = 0; z < g_VoxelDimensions.z; z++)
-    {
-        uint index = x + y * g_VoxelDimensions.x + z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-        if (g_Voxels[index] < 0)
-        {
-            inside = !inside;
-        }
-        if (inside)
-        {
-             g_Voxels[index] = -1.0;
-        }
-    }
-}
-[numthreads(8,8,8)]
-void JFA_Seed(uint3 id : SV_DispatchThreadID)
-{
-    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
-    if (g_Voxels[index] < 0) {
-        g_JFAGrid[index] = id.xyz; // This is a surface voxel, so it is its own seed.
-    } else {
-        g_JFAGrid[index] = int3(-1, -1, -1); // Mark as unseeded.
-    }
-}
-[numthreads(8,8,8)]
-void JFA_Pass(uint3 id : SV_DispatchThreadID)
-{
-    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
-    int3 p = id.xyz;
-    int3 best_seed = g_JFAGrid[index];
-    float min_dist_sq = 1e20;
-    if (best_seed.x != -1)
-    {
-        min_dist_sq = dot(p - best_seed, p - best_seed);
-    }
-    // Sample neighbors in a 3x3x3 grid at the current step size
-    for (int z = -1; z <= 1; ++z)
-    {
-        for (int y = -1; y <= 1; ++y)
-        {
-            for (int x = -1; x <= 1; ++x)
-            {
-                int3 neighbor_p = p + int3(x, y, z) * g_JfaStep;
-                if (all(neighbor_p >= 0) && all(neighbor_p < g_VoxelDimensions))
-                {
-                    uint neighbor_idx = neighbor_p.x + neighbor_p.y * g_VoxelDimensions.x + neighbor_p.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-                    int3 neighbor_seed = g_JFAGrid[neighbor_idx];
-                    if (neighbor_seed.x != -1)
-                    {
-                        float dist_sq = dot(p - neighbor_seed, p - neighbor_seed);
-                        if (dist_sq < min_dist_sq)
-                        {
-                            min_dist_sq = dist_sq;
-                            best_seed = neighbor_seed;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    g_JFAGrid[index] = best_seed;
-}
-[numthreads(8,8,8)]
-void FinalizeSDF (uint3 id : SV_DispatchThreadID)
-{
-    uint index = id.x + id.y * g_VoxelDimensions.x + id.z * g_VoxelDimensions.x * g_VoxelDimensions.y;
-    if (index >= g_VoxelDimensions.x * g_VoxelDimensions.y * g_VoxelDimensions.z) return;
-    int3 seed = g_JFAGrid[index];
-    if (seed.x != -1)
-    {
-        float3 voxel_size = g_VoxelBoundsSize / g_VoxelDimensions;
-        float3 p_world = g_VoxelBoundsMin + (id.xyz + 0.5) * voxel_size;
-        float3 seed_world = g_VoxelBoundsMin + (seed + 0.5) * voxel_size;
-        float dist = length(p_world - seed_world);
-        // Apply sign based on the solidification pass result (stored in g_Voxels)
-        g_Voxels[index] = (g_Voxels[index] < 0) ? -dist : dist;
-    }
-    else
-    {
-        // Should not happen if JFA is complete, but as a fallback, mark as far away.
-        g_Voxels[index] = g_VoxelBoundsSize.x;
-    }
-}
-";
-            private static ComputeShader _voxelizerShader;
-            // Kernels
-            private static int _kernelClear;
-            private static int _kernelVoxelize;
-            private static int _kernelSolidify;
-            private static int _kernelJfaSeed;
-            private static int _kernelJfaPass;
-            private static int _kernelFinalizeSdf;
-            // Buffers
-            private static ComputeBuffer _vertexBuffer;
-            private static ComputeBuffer _indexBuffer;
-            private static ComputeBuffer _voxelBuffer; // Stores solid voxelization (temp) and final SDF
-            private static ComputeBuffer _jfaGridBuffer; // Stores seed coordinates
-#if UNITY_EDITOR
-            private static ComputeShader GetOrCreateVoxelizerShader()
-            {
-                if (_voxelizerShader == null)
-                {
-                    // Attempt to find a pre-compiled shader from resources first
-                    _voxelizerShader = Resources.FindObjectsOfTypeAll<ComputeShader>().FirstOrDefault(cs => cs.name == "VoxelizerInternal");
-
-                    if (_voxelizerShader == null)
-                    {
-                        // As a fallback, create the shader entirely in memory without creating assets
-                        _voxelizerShader = new ComputeShader();
-                        _voxelizerShader.name = "VoxelizerInternal";
-                        _voxelizerShader.hideFlags = HideFlags.HideAndDontSave; // In-memory only
-
-                        // Unity does not have a public API to create a shader from a string directly.
-                        // The asset pipeline is required. We create it in a temp location and load it.
-                        string tempPath = "Assets/VoxelizerInternal_Temp.compute";
-                        File.WriteAllText(tempPath, VoxelizerShaderSource);
-                        AssetDatabase.ImportAsset(tempPath);
-                        _voxelizerShader = AssetDatabase.LoadAssetAtPath<ComputeShader>(tempPath);
-                        AssetDatabase.DeleteAsset(tempPath); // Clean up immediately
-                    }
-                }
-                return _voxelizerShader;
-            }
-#endif
-            public static void Voxelize(MeshData mesh, bool generateSdf)
-            {
-#if UNITY_EDITOR
-                ComputeShader shader = GetOrCreateVoxelizerShader();
-                if (shader == null)
-                {
-                    Debug.LogError("Failed to create internal voxelization compute shader.");
-                    return;
-                }
-#else
-                Debug.LogError("GPU Voxelization is only supported in the Unity Editor in this version.");
-                return;
-#endif
-                // 1. Find all necessary kernels
-                _kernelClear = shader.FindKernel("Clear");
-                _kernelVoxelize = shader.FindKernel("VoxelizeSurface");
-                _kernelSolidify = shader.FindKernel("Solidify");
-                if (generateSdf)
-                {
-                    _kernelJfaSeed = shader.FindKernel("JFA_Seed");
-                    _kernelJfaPass = shader.FindKernel("JFA_Pass");
-                    _kernelFinalizeSdf = shader.FindKernel("FinalizeSDF");
-                }
-                // 2. Create and set buffers
-                int triangleCount = mesh.indices.Count / 3;
-                _vertexBuffer = new ComputeBuffer(mesh.vertexCount, sizeof(float) * 3);
-                _vertexBuffer.SetData(mesh.vertices);
-                _indexBuffer = new ComputeBuffer(mesh.indices.Count, sizeof(int));
-                _indexBuffer.SetData(mesh.indices);
-                int voxelCount = mesh.voxelDimensions.x * mesh.voxelDimensions.y * mesh.voxelDimensions.z;
-                _voxelBuffer = new ComputeBuffer(voxelCount, sizeof(float));
-                // Set common uniforms and buffers
-                shader.SetInt("g_TriangleCount", triangleCount);
-                shader.SetInts("g_VoxelDimensions", new int[] { mesh.voxelDimensions.x, mesh.voxelDimensions.y, mesh.voxelDimensions.z });
-                shader.SetVector("g_VoxelBoundsMin", mesh.voxelBounds.min);
-                shader.SetVector("g_VoxelBoundsSize", mesh.voxelBounds.size);
-                shader.SetBuffer(_kernelVoxelize, "g_Vertices", _vertexBuffer);
-                shader.SetBuffer(_kernelVoxelize, "g_Indices", _indexBuffer);
-                // 3. Dispatch Clear Kernel
-                shader.SetBuffer(_kernelClear, "g_Voxels", _voxelBuffer);
-                Dispatch(shader, _kernelClear, voxelCount);
-                // 4. Dispatch Voxelize Kernel to create surface voxelization
-                shader.SetBuffer(_kernelVoxelize, "g_Voxels", _voxelBuffer);
-                Dispatch(shader, _kernelVoxelize, triangleCount);
-                // 5. Dispatch Solidify Kernel (using a parallel scanline flood fill)
-                shader.SetBuffer(_kernelSolidify, "g_Voxels", _voxelBuffer);
-                Dispatch(shader, _kernelSolidify, mesh.voxelDimensions.x * mesh.voxelDimensions.y);
-                // 6. If SDF is enabled, run the full JFA pipeline
-                if (generateSdf)
-                {
-                    _jfaGridBuffer = new ComputeBuffer(voxelCount, sizeof(int) * 3);
-                    // 6a. Seed the JFA grid from the surface voxels
-                    shader.SetBuffer(_kernelJfaSeed, "g_Voxels", _voxelBuffer);
-                    shader.SetBuffer(_kernelJfaSeed, "g_JFAGrid", _jfaGridBuffer);
-                    Dispatch(shader, _kernelJfaSeed, voxelCount);
-                    // 6b. Run JFA passes with decreasing step sizes
-                    int maxDim = Mathf.Max(mesh.voxelDimensions.x, Mathf.Max(mesh.voxelDimensions.y, mesh.voxelDimensions.z));
-                    int step = (int)Mathf.Pow(2, Mathf.Floor(Mathf.Log2(maxDim)));
-                    shader.SetBuffer(_kernelJfaPass, "g_JFAGrid", _jfaGridBuffer);
-                    while (step >= 1)
-                    {
-                        shader.SetInt("g_JfaStep", step);
-                        Dispatch(shader, _kernelJfaPass, voxelCount);
-                        step /= 2;
-                    }
-                    // 6c. Finalize the SDF calculation
-                    shader.SetBuffer(_kernelFinalizeSdf, "g_Voxels", _voxelBuffer);
-                    shader.SetBuffer(_kernelFinalizeSdf, "g_JFAGrid", _jfaGridBuffer);
-                    Dispatch(shader, _kernelFinalizeSdf, voxelCount);
-                    _jfaGridBuffer.Release();
-                }
-                // 7. Read back data and release buffers
-                _voxelBuffer.GetData(mesh.sdfValues);
-                _vertexBuffer.Release();
-                _indexBuffer.Release();
-                _voxelBuffer.Release();
-            }
-            private static void Dispatch(ComputeShader shader, int kernel, int count)
-            {
-                shader.GetKernelThreadGroupSizes(kernel, out uint x, out uint y, out uint z);
-                int threadGroupX = Mathf.CeilToInt(count / (float)x);
-                int threadGroupY = Mathf.CeilToInt(1 / (float)y);
-                int threadGroupZ = Mathf.CeilToInt(1 / (float)z);
-                shader.Dispatch(kernel, threadGroupX, threadGroupY, threadGroupZ);
-            }
-        }
         /// <summary>
         /// Represents a Quadric Error Metric for a vertex, stored as a 4x4 symmetric matrix.
         /// </summary>
@@ -5849,119 +5829,370 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                 return (normal, point);
             }
         }
+
         /// <summary>
-        /// Utility for splitting a MeshData object by a plane.
+        /// A feature-aware plane evaluator inspired by CoACD (Collision-Aware Convex Decomposition).
+        /// This class generates and scores candidate split planes based on concavity, balance, and feature preservation.
         /// </summary>
-        public static class MeshSplitter
+        public static class CoACDPlaneEvaluator
         {
-            public static void Split(MeshData original, PlaneF plane, out MeshData positiveSide, out MeshData negativeSide)
+            /// <summary>
+            /// Finds the optimal split plane for a given mesh part using a CoACD-style evaluation.
+            /// </summary>
+            public static (Vector3 normal, Vector3 point) FindBestSplitPlane(MeshData mesh, ConvexDecompositionSettings settings)
+            {
+                var candidates = GenerateCandidates(mesh, settings);
+                if (candidates.Count == 0)
+                {
+                    // Fallback to PCA if no other candidates are found
+                    SplitPlaneEvaluator.CalculatePCA(mesh.vertices, out var pca, out _, out _);
+                    return (pca, mesh.bounds.center);
+                }
+
+                (Vector3 normal, Vector3 point) bestPlane = (Vector3.zero, Vector3.zero);
+                float bestScore = float.MaxValue;
+
+                foreach (var candidate in candidates)
+                {
+                    float score = ScorePlane(mesh, candidate.normal, candidate.point, settings);
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        bestPlane = candidate;
+                    }
+                }
+                return bestPlane;
+            }
+
+            /// <summary>
+            /// Generates a set of candidate split planes.
+            /// </summary>
+            private static List<(Vector3 normal, Vector3 point)> GenerateCandidates(MeshData mesh, ConvexDecompositionSettings settings)
+            {
+                var candidates = new List<(Vector3 normal, Vector3 point)>();
+                if (mesh.featureVertices == null || mesh.featureVertices.Count < 2) return candidates;
+
+                // Generate planes from pairs of feature points
+                int numSamples = Math.Min(mesh.featureVertices.Count, settings.maxFeatureSamples);
+                for (int i = 0; i < numSamples; i++)
+                {
+                    for (int j = i + 1; j < numSamples; j++)
+                    {
+                        var p1 = mesh.vertices[mesh.featureVertices[i]];
+                        var p2 = mesh.vertices[mesh.featureVertices[j]];
+                        var midPoint = (p1 + p2) / 2.0f;
+                        var normal = (p2 - p1).normalized;
+                        if (normal.sqrMagnitude > 0.1f)
+                        {
+                            candidates.Add((normal, midPoint));
+                        }
+                    }
+                }
+                return candidates;
+            }
+
+            /// <summary>
+            /// Scores a candidate plane based on a weighted combination of factors.
+            /// </summary>
+            private static float ScorePlane(MeshData mesh, Vector3 normal, Vector3 point, ConvexDecompositionSettings settings)
+            {
+                float concavityCost = CalculateConcavityCost(mesh, normal, point);
+                float balanceCost = CalculateBalanceCost(mesh, normal, point);
+                float sharpnessCost = CalculateSharpnessCost(mesh, normal, point, settings.sharpEdgeAngle);
+
+                // Final score is a weighted sum of the individual costs
+                return settings.concavityWeight * concavityCost +
+                       settings.balanceWeight * balanceCost +
+                       settings.sharpnessWeight * sharpnessCost;
+            }
+
+            /// <summary>
+            /// Calculates a cost based on how much concavity the split resolves.
+            /// A lower cost is better, indicating a more significant reduction in concavity.
+            /// </summary>
+            private static float CalculateConcavityCost(MeshData mesh, Vector3 normal, Vector3 point)
+            {
+                if (mesh.sdfValues == null || !mesh.sdfValues.IsCreated) return 1.0f; // No data, max penalty
+
+                float totalConcavity = 0;
+                for(int i=0; i<mesh.sdfValues.Length; i++)
+                {
+                    if (mesh.sdfValues[i] > 0) totalConcavity += mesh.sdfValues[i];
+                }
+                if (totalConcavity < 1e-5f) return 0; // No concavity to resolve
+
+                float cutConcavity = 0;
+                var voxelSize = mesh.voxelBounds.size / new Vector3(mesh.voxelDimensions.x, mesh.voxelDimensions.y, mesh.voxelDimensions.z);
+                float planeCheckDist = voxelSize.magnitude;
+
+                for(int i=0; i<mesh.sdfValues.Length; i++)
+                {
+                    var coord = mesh.GetVoxelCoord(i);
+                    var worldPos = mesh.VoxelToWorld(coord);
+                    float distToPlane = Vector3.Dot(worldPos - point, normal);
+
+                    // Check if the voxel is on the cut surface
+                    if (Mathf.Abs(distToPlane) < planeCheckDist && mesh.sdfValues[i] > 0)
+                    {
+                        cutConcavity += mesh.sdfValues[i];
+                    }
+                }
+
+                // The cost is the inverse of the concavity resolved by the cut.
+                return 1.0f - (cutConcavity / totalConcavity);
+            }
+
+            /// <summary>
+            /// Calculates a cost based on the balance of the resulting split.
+            /// A lower cost indicates a more balanced split.
+            /// </summary>
+            private static float CalculateBalanceCost(MeshData mesh, Vector3 normal, Vector3 point)
+            {
+                int posCount = 0;
+                int negCount = 0;
+                foreach (var v in mesh.vertices)
+                {
+                    if (Vector3.Dot(v - point, normal) > 0) posCount++;
+                    else negCount++;
+                }
+                if (posCount == 0 || negCount == 0) return 1.0f; // Invalid split, max penalty
+
+                float total = posCount + negCount;
+                return Mathf.Abs(posCount - negCount) / total;
+            }
+
+            /// <summary>
+            /// Calculates a penalty for cutting through sharp edges.
+            /// A lower cost indicates fewer sharp edges were cut.
+            /// </summary>
+            private static float CalculateSharpnessCost(MeshData mesh, Vector3 normal, Vector3 point, float sharpEdgeAngle)
+            {
+                if (mesh.sharpEdges == null || mesh.sharpEdges.Count == 0)
+                {
+                    mesh.IdentifySharpEdges(sharpEdgeAngle);
+                }
+                if (mesh.sharpEdges.Count == 0) return 0;
+
+                int cuts = 0;
+                var uniqueSharpEdges = new HashSet<(int, int)>();
+                // This is slow. A better approach would be to build an edge list from sharp edge indices.
+                // For now, this is a functional placeholder.
+                for (int i = 0; i < mesh.indices.Count; i += 3)
+                {
+                    for (int j = 0; j < 3; j++)
+                    {
+                        int v1_idx = mesh.indices[i + j];
+                        int v2_idx = mesh.indices[i + (j + 1) % 3];
+                        if (mesh.sharpEdges.Contains(v1_idx) && mesh.sharpEdges.Contains(v2_idx))
+                        {
+                            var edge = v1_idx < v2_idx ? (v1_idx, v2_idx) : (v2_idx, v1_idx);
+                            if (uniqueSharpEdges.Add(edge))
+                            {
+                                float d1 = Vector3.Dot(mesh.vertices[v1_idx] - point, normal);
+                                float d2 = Vector3.Dot(mesh.vertices[v2_idx] - point, normal);
+                                if (d1 * d2 < 0) // Edge crosses the plane
+                                {
+                                    cuts++;
+                                }
+                            }
+                        }
+                    }
+                }
+                return (float)cuts / uniqueSharpEdges.Count;
+            }
+        }
+        /// <summary>
+        /// A comprehensive utility for splitting meshes by a plane. It includes robust triangle clipping,
+        /// interpolation of all vertex attributes, and optional hole capping to produce watertight meshes.
+        /// </summary>
+        public static class MeshCutter
+        {
+            /// <summary>
+            /// Cuts a mesh by a plane, producing two new meshes.
+            /// </summary>
+            /// <param name="original">The mesh to cut.</param>
+            /// <param name="plane">The plane to cut with.</param>
+            /// <param name="positiveSide">The part of the mesh on the positive side of the plane.</param>
+            /// <param name="negativeSide">The part of the mesh on the negative side of the plane.</param>
+            /// <param name="capHoles">If true, new faces will be generated to close the holes created by the cut.</param>
+            public static void Cut(MeshData original, PlaneF plane, out MeshData positiveSide, out MeshData negativeSide, bool capHoles = true)
             {
                 positiveSide = new MeshData();
                 negativeSide = new MeshData();
-                var positiveVerts = new List<Vector3>();
-                var negativeVerts = new List<Vector3>();
-                int[] posRemap = new int[original.vertices.Count];
-                int[] negRemap = new int[original.vertices.Count];
-                float[] vertDistances = new float[original.vertices.Count];
-                for (int i = 0; i < original.vertices.Count; i++)
+                var newBoundaryEdges = new List<(int posIdx, int negIdx)>();
+
+                var vertDistances = new float[original.vertexCount];
+                for (int i = 0; i < original.vertexCount; i++)
                 {
                     vertDistances[i] = plane.DistanceToPoint(original.vertices[i]);
                 }
+
+                var posRemap = new Dictionary<int, int>();
+                var negRemap = new Dictionary<int, int>();
+
                 for (int i = 0; i < original.indices.Count; i += 3)
                 {
                     int i0 = original.indices[i];
                     int i1 = original.indices[i + 1];
                     int i2 = original.indices[i + 2];
+
                     float d0 = vertDistances[i0];
                     float d1 = vertDistances[i1];
                     float d2 = vertDistances[i2];
-                    int posCount = (d0 > 0 ? 1 : 0) + (d1 > 0 ? 1 : 0) + (d2 > 0 ? 1 : 0);
-                    if (posCount == 3)
+
+                    bool onPos0 = d0 >= 0;
+                    bool onPos1 = d1 >= 0;
+                    bool onPos2 = d2 >= 0;
+
+                    int positiveCount = (onPos0 ? 1 : 0) + (onPos1 ? 1 : 0) + (onPos2 ? 1 : 0);
+
+                    if (positiveCount == 3)
                     {
                         AddTriangle(positiveSide, original, i0, i1, i2, posRemap);
                     }
-                    else if (posCount == 0)
+                    else if (positiveCount == 0)
                     {
                         AddTriangle(negativeSide, original, i0, i1, i2, negRemap);
                     }
                     else // Triangle is clipped by the plane
                     {
-                        ClipTriangle(original, plane, i0, i1, i2, d0, d1, d2, positiveSide, negativeSide, posRemap, negRemap);
+                        ClipTriangle(original, plane, vertDistances, i0, i1, i2, positiveSide, negativeSide, posRemap, negRemap, newBoundaryEdges);
                     }
                 }
-                positiveSide.Optimize();
-                negativeSide.Optimize();
+
+                if (capHoles && newBoundaryEdges.Count > 0)
+                {
+                    CapHoles(positiveSide, negativeSide, newBoundaryEdges, plane);
+                }
+
+                positiveSide.CalculateProperties();
+                negativeSide.CalculateProperties();
             }
-            private static void AddTriangle(MeshData mesh, MeshData original, int i0, int i1, int i2, int[] remap)
+
+            private static int RemapOrAddVertex(MeshData mesh, MeshData original, int originalIndex, Dictionary<int, int> remap)
             {
-                int r0 = RemapVertex(mesh, original, i0, remap);
-                int r1 = RemapVertex(mesh, original, i1, remap);
-                int r2 = RemapVertex(mesh, original, i2, remap);
-                mesh.indices.Add(r0); mesh.indices.Add(r1); mesh.indices.Add(r2);
-            }
-            private static int RemapVertex(MeshData mesh, MeshData original, int originalIndex, int[] remap)
-            {
-                if (remap[originalIndex] > 0) return remap[originalIndex] - 1;
-                int newIndex = mesh.vertices.Count;
+                if (remap.TryGetValue(originalIndex, out int newIndex))
+                {
+                    return newIndex;
+                }
+
+                newIndex = mesh.vertices.Count;
                 mesh.vertices.Add(original.vertices[originalIndex]);
-                if (original.normals.Count > originalIndex) mesh.normals.Add(original.normals[originalIndex]);
-                remap[originalIndex] = newIndex + 1;
+                if (original.normals != null && original.normals.Count > 0) mesh.normals.Add(original.normals[originalIndex]);
+                if (original.uvs != null && original.uvs.Count > 0) { if (mesh.uvs == null) mesh.uvs = new List<Vector2>(); mesh.uvs.Add(original.uvs[originalIndex]); }
+                if (original.tangents != null && original.tangents.Count > 0) { if (mesh.tangents == null) mesh.tangents = new List<Vector4>(); mesh.tangents.Add(original.tangents[originalIndex]); }
+                if (original.colors != null && original.colors.Count > 0) { if (mesh.colors == null) mesh.colors = new List<Color>(); mesh.colors.Add(original.colors[originalIndex]); }
+
+                remap[originalIndex] = newIndex;
                 return newIndex;
             }
-            private static void ClipTriangle(MeshData original, PlaneF plane, int i0, int i1, int i2, float d0, float d1, float d2, MeshData posMesh, MeshData negMesh, int[] posRemap, int[] negRemap)
+
+            private static void AddTriangle(MeshData mesh, MeshData original, int i0, int i1, int i2, Dictionary<int, int> remap)
             {
-                int[] indices = { i0, i1, i2 };
-                float[] distances = { d0, d1, d2 };
-                List<int> posIndices = new List<int>();
-                List<int> negIndices = new List<int>();
+                int r0 = RemapOrAddVertex(mesh, original, i0, remap);
+                int r1 = RemapOrAddVertex(mesh, original, i1, remap);
+                int r2 = RemapOrAddVertex(mesh, original, i2, remap);
+                mesh.indices.AddRange(new[] { r0, r1, r2 });
+            }
+
+            private static int AddInterpolatedVertex(MeshData mesh, MeshData original, int i0, int i1, float t)
+            {
+                int newIndex = mesh.vertices.Count;
+                mesh.vertices.Add(Vector3.Lerp(original.vertices[i0], original.vertices[i1], t));
+                if (original.normals != null && original.normals.Count > 0) mesh.normals.Add(Vector3.Lerp(original.normals[i0], original.normals[i1], t).normalized);
+                if (original.uvs != null && original.uvs.Count > 0) { if (mesh.uvs == null) mesh.uvs = new List<Vector2>(); mesh.uvs.Add(Vector2.Lerp(original.uvs[i0], original.uvs[i1], t)); }
+                if (original.tangents != null && original.tangents.Count > 0) { if (mesh.tangents == null) mesh.tangents = new List<Vector4>(); mesh.tangents.Add(Vector4.Lerp(original.tangents[i0], original.tangents[i1], t)); }
+                if (original.colors != null && original.colors.Count > 0) { if (mesh.colors == null) mesh.colors = new List<Color>(); mesh.colors.Add(Color.Lerp(original.colors[i0], original.colors[i1], t)); }
+                return newIndex;
+            }
+
+            private static void ClipTriangle(MeshData original, PlaneF plane, float[] vertDistances, int i0, int i1, int i2, MeshData posMesh, MeshData negMesh, Dictionary<int, int> posRemap, Dictionary<int, int> negRemap, List<(int, int)> newBoundaryEdges)
+            {
+                var indices = new int[] { i0, i1, i2 };
+                var distances = new float[] { vertDistances[i0], vertDistances[i1], vertDistances[i2] };
+
+                var posVerts = new List<int>();
+                var negVerts = new List<int>();
+
                 for (int i = 0; i < 3; i++)
                 {
-                    int current = indices[i];
-                    int next = indices[(i + 1) % 3];
-                    float dCurrent = distances[i];
-                    float dNext = distances[(i + 1) % 3];
-                    if (dCurrent >= 0)
+                    int p1_idx = indices[i];
+                    int p2_idx = indices[(i + 1) % 3];
+                    float d1 = distances[i];
+                    float d2 = distances[(i + 1) % 3];
+
+                    if (d1 >= 0) posVerts.Add(RemapOrAddVertex(posMesh, original, p1_idx, posRemap));
+                    else negVerts.Add(RemapOrAddVertex(negMesh, original, p1_idx, negRemap));
+
+                    if (d1 * d2 < 0)
                     {
-                        posIndices.Add(RemapVertex(posMesh, original, current, posRemap));
-                    }
-                    else
-                    {
-                        negIndices.Add(RemapVertex(negMesh, original, current, negRemap));
-                    }
-                    // If edge crosses plane, create new vertex
-                    if (dCurrent * dNext < 0)
-                    {
-                        float t = dCurrent / (dCurrent - dNext);
-                        Vector3 intersectPoint = Vector3.Lerp(original.vertices[current], original.vertices[next], t);
-                        int newPosVert = posMesh.vertices.Count;
-                        posMesh.vertices.Add(intersectPoint);
-                        posIndices.Add(newPosVert);
-                        int newNegVert = negMesh.vertices.Count;
-                        negMesh.vertices.Add(intersectPoint);
-                        negIndices.Add(newNegVert);
+                        float t = d1 / (d1 - d2);
+                        int newPosIdx = AddInterpolatedVertex(posMesh, original, p1_idx, p2_idx, t);
+                        posVerts.Add(newPosIdx);
+
+                        int newNegIdx = AddInterpolatedVertex(negMesh, original, p1_idx, p2_idx, t);
+                        negVerts.Add(newNegIdx);
+
+                        newBoundaryEdges.Add((newPosIdx, newNegIdx));
                     }
                 }
-                // Triangulate resulting polygons
-                if (posIndices.Count >= 3)
+
+                if (posVerts.Count >= 3) { posMesh.indices.Add(posVerts[0]); posMesh.indices.Add(posVerts[1]); posMesh.indices.Add(posVerts[2]); }
+                if (posVerts.Count == 4) { posMesh.indices.Add(posVerts[0]); posMesh.indices.Add(posVerts[2]); posMesh.indices.Add(posVerts[3]); }
+                if (negVerts.Count >= 3) { negMesh.indices.Add(negVerts[0]); negMesh.indices.Add(negVerts[1]); negMesh.indices.Add(negVerts[2]); }
+                if (negVerts.Count == 4) { negMesh.indices.Add(negVerts[0]); negMesh.indices.Add(negVerts[2]); negMesh.indices.Add(negVerts[3]); }
+            }
+
+            private static void CapHoles(MeshData positiveSide, MeshData negativeSide, List<(int posIdx, int negIdx)> boundaryEdges, PlaneF plane)
+            {
+                // This is a simplified capping method that assumes the hole is a single, convex polygon.
+                // A robust solution for arbitrary concave holes would require a more complex triangulation algorithm (e.g., ear clipping).
+                var planeVerts = boundaryEdges.Select(e => e.posIdx).Distinct().ToList();
+                if (planeVerts.Count < 3) return;
+
+                GetPlaneBasis(plane.n, out var basisX, out var basisY);
+
+                var points2D = planeVerts.Select(idx => {
+                    var p3d = positiveSide.vertices[idx];
+                    return new Vector2(Vector3.Dot(p3d, basisX), Vector3.Dot(p3d, basisY));
+                }).ToList();
+
+                var centroid = Vector2.zero;
+                foreach(var p in points2D) centroid += p;
+                centroid /= points2D.Count;
+
+                var sortedIndices = Enumerable.Range(0, planeVerts.Count)
+                    .OrderBy(i => Mathf.Atan2(points2D[i].y - centroid.y, points2D[i].x - centroid.x))
+                    .ToList();
+
+                for (int i = 1; i < sortedIndices.Count - 1; i++)
                 {
-                    for (int i = 1; i < posIndices.Count - 1; i++)
-                    {
-                        posMesh.indices.Add(posIndices[0]);
-                        posMesh.indices.Add(posIndices[i]);
-                        posMesh.indices.Add(posIndices[i + 1]);
-                    }
-                }
-                if (negIndices.Count >= 3)
-                {
-                    for (int i = 1; i < negIndices.Count - 1; i++)
-                    {
-                        negMesh.indices.Add(negIndices[0]);
-                        negMesh.indices.Add(negIndices[i]);
-                        negMesh.indices.Add(negIndices[i + 1]);
-                    }
+                    int i0_sorted = sortedIndices[0];
+                    int i1_sorted = sortedIndices[i];
+                    int i2_sorted = sortedIndices[i+1];
+
+                    // Add to positive side
+                    int pos_i0 = planeVerts[i0_sorted];
+                    int pos_i1 = planeVerts[i1_sorted];
+                    int pos_i2 = planeVerts[i2_sorted];
+                    positiveSide.indices.AddRange(new []{ pos_i0, pos_i2, pos_i1 });
+
+                    // Find corresponding verts on negative side and add.
+                    int neg_i0 = boundaryEdges.First(e => e.posIdx == pos_i0).negIdx;
+                    int neg_i1 = boundaryEdges.First(e => e.posIdx == pos_i1).negIdx;
+                    int neg_i2 = boundaryEdges.First(e => e.posIdx == pos_i2).negIdx;
+                    negativeSide.indices.AddRange(new []{ neg_i0, neg_i1, neg_i2 });
                 }
             }
-            // Additional: Multi-plane split
+
+            private static void GetPlaneBasis(Vector3 normal, out Vector3 basisX, out Vector3 basisY)
+            {
+                basisX = Vector3.Cross(normal, Vector3.up);
+                if (basisX.sqrMagnitude < 0.01f) basisX = Vector3.Cross(normal, Vector3.right);
+                basisX.Normalize();
+                basisY = Vector3.Cross(normal, basisX).normalized;
+            }
+
             public static List<MeshData> MultiSplit(MeshData original, List<PlaneF> planes)
             {
                 var parts = new List<MeshData> { original };
@@ -5970,7 +6201,7 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                     var newParts = new List<MeshData>();
                     foreach (var part in parts)
                     {
-                        Split(part, plane, out MeshData pos, out MeshData neg);
+                        Cut(part, plane, out MeshData pos, out MeshData neg);
                         if (pos.vertices.Count > 3) newParts.Add(pos);
                         if (neg.vertices.Count > 3) newParts.Add(neg);
                     }
@@ -5996,7 +6227,7 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
         private bool isProcessing = false;
         private static bool enableDetailedLoggingStatic = false; // Static for class-wide logging
         private static bool enableProfilingStatic = false;
-        float ToUnitsFromMm(float mm) => (mm * 0.001f) * settings.unitsPerMeter;
+        float ToUnitsFromMm(float mm) => (mm * 0.001f) * (settings.unitsPerMeter);
         void Start()
         {
             if (sourceObject == null)
@@ -6182,7 +6413,7 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                 processQueue.TryDequeue(out var(currentMesh, currentConcavity), out _);
                 if (currentMesh.vertices.Count < 4) continue;
                 // 1. Generate convex hull for the current mesh part
-                var hull = QuickHullImplementation.ComputeConvexHullFromPoints(currentMesh.vertices);
+                var hull = QuickHull3D.Compute(currentMesh.vertices);
                 if (hull.vertices.Count < 4) continue;
                 hull.BuildPlanes();
                 // 2. Calculate concavity using voxel/SDF
@@ -6194,26 +6425,35 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                     continue;
                 }
                 // 4. If concavity is too high, find best split plane
-                var (splitNormal, splitPoint) = SplitPlaneEvaluator.FindBestSplitPlane(currentMesh, hull, concavity);
+                (Vector3 splitNormal, Vector3 splitPoint) = (Vector3.zero, Vector3.zero);
+                if (settings.acdMethod == ACDSubroutineType.CoACD)
+                {
+                    (splitNormal, splitPoint) = CoACDPlaneEvaluator.FindBestSplitPlane(currentMesh, settings);
+                }
+                else
+                {
+                    (splitNormal, splitPoint) = SplitPlaneEvaluator.FindBestSplitPlane(currentMesh, hull, concavity);
+                }
+
                 if(settings.drawSplitPlanes)
                 {
                     debugSplitPlanes.Add((splitPoint, splitNormal));
                 }
                 var splitPlane = new PlaneF { n = splitNormal, d = -Vector3.Dot(splitNormal, splitPoint) };
                 // 5. Split the mesh
-                MeshSplitter.Split(currentMesh, splitPlane, out MeshData positiveSide, out MeshData negativeSide);
+                MeshCutter.Cut(currentMesh, splitPlane, out MeshData positiveSide, out MeshData negativeSide);
                 // 6. Add new parts back to the queue with concavity priority
                 if (positiveSide.vertices.Count > 3)
                 {
                     positiveSide.Voxelize(settings);
-                    positiveSide.ComputeSDF(settings.sdfMethod, settings.sdfIterationCount, settings.sdfSmoothingFactor);
+                    positiveSide.ComputeSDF(settings);
                     float posConcavity = CalculateConcavity(positiveSide, null);
                     processQueue.Enqueue((positiveSide, posConcavity));
                 }
                 if (negativeSide.vertices.Count > 3)
                 {
                     negativeSide.Voxelize(settings);
-                    negativeSide.ComputeSDF(settings.sdfMethod, settings.sdfIterationCount, settings.sdfSmoothingFactor);
+                    negativeSide.ComputeSDF(settings);
                     float negConcavity = CalculateConcavity(negativeSide, null);
                     processQueue.Enqueue((negativeSide, negConcavity));
                 }
@@ -6224,7 +6464,7 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                 processQueue.TryDequeue(out var(mesh, _), out _);
                 if (mesh.vertices.Count > 3)
                 {
-                    finalHulls.Add(QuickHullImplementation.ComputeConvexHullFromPoints(mesh.vertices));
+                    finalHulls.Add(QuickHull3D.Compute(mesh.vertices));
                 }
             }
             return finalHulls;
@@ -6233,7 +6473,7 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
         {
             if (hull == null)
             {
-                hull = QuickHullImplementation.ComputeConvexHullFromPoints(mesh.vertices);
+                hull = QuickHull3D.Compute(mesh.vertices);
             }
             // Use SDF/voxel-based concavity
             float maxConcavity = 0f;
@@ -6406,7 +6646,8 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                 originalMeshVolume = combinedMesh.volume,
                 originalMeshSurfaceArea = combinedMesh.surfaceArea
             };
-            metrics.errorDistribution = ErrorCalculator.CalculateErrorDistribution(combinedMesh, hulls, 1000);
+            metrics.averageError = ErrorCalculator.CalculateSymmetricHausdorff(combinedMesh, hulls, settings.maxSampleCount);
+            metrics.errorDistribution = ErrorCalculator.CalculateErrorDistribution(combinedMesh, hulls, settings.maxSampleCount);
             metrics.hullMetrics.Clear();
             for (int i = 0; i < hulls.Count; i++)
             {
@@ -6425,10 +6666,21 @@ void FinalizeSDF (uint3 id : SV_DispatchThreadID)
                 };
                 metrics.hullMetrics.Add(hullMetric);
             }
-            metrics.CalculateDerivedMetrics();
+            metrics.CalculateDerivedMetrics(combinedMesh.volume, combinedMesh.surfaceArea);
             // Additional: Export if profiling
-            if (settings.enableProfiling)
-                metrics.ExportToCSV("decomposition_metrics.csv");
+            if (settings.enableProfilingStatic)
+                ExportMetricsToCSV(metrics, "decomposition_metrics.csv");
+        }
+
+        private void ExportMetricsToCSV(DecompositionMetrics m, string path)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("Metric,Value");
+            sb.AppendLine($"TotalTime,{m.totalTime}");
+            sb.AppendLine($"HullCount,{m.hullCount}");
+            sb.AppendLine($"AverageError,{m.averageError}");
+            // Add more metrics...
+            File.WriteAllText(path, sb.ToString());
         }
         private void ClearResults()
         {
